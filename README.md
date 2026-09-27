@@ -40,7 +40,7 @@ The SDK is the `py-mx-eye` package; `uv sync --all-extras` installs it.
 ```python
 from py_mx_eye import Client
 
-with Client('127.0.0.1') as eye:
+with Client("127.0.0.1") as eye:
     eye.start()
     # Inside your behavioral-task loop:
     sample = eye.latest(max_age_ms=50)

@@ -3,9 +3,10 @@
 Copied from mx_eye/widgets.py so the client does not depend on the tracker
 package; the tracker keeps its own copy.
 """
+
 from PySide6 import QtWidgets as W
 
-STYLE = '''
+STYLE = """
 QWidget { background:#10151d; color:#dce6f1; font-family:Inter,Segoe UI,sans-serif; font-size:12px; }
 QMainWindow,QDialog { background:#10151d; }
 QLabel#brand { font-size:23px; font-weight:700; color:#f2f7ff; }
@@ -24,10 +25,11 @@ QTabBar::tab:selected { background:#2b405b; }
 QCheckBox { spacing:7px; }
 QSplitter::handle { background:#253345; }
 QToolTip { background:#233145; color:#eaf3ff; border:1px solid #536b89; }
-'''
+"""
+
 
 def label(text, name=None):
-    w=W.QLabel(text)
+    w = W.QLabel(text)
     if name:
         w.setObjectName(name)
     return w

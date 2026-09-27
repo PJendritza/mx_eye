@@ -1,5 +1,7 @@
 # mx_eye
 
+English | [中文](README.zh.md)
+
 First integrated MXBI pupil / corneal-reflection tracker, with a separate receiver SDK and client.
 Python 3.11+; desktop UI for Windows/Linux.
 

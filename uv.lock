@@ -363,10 +363,14 @@ version = "0.1.0"
 source = { editable = "packages/py-mx-eye" }
 dependencies = [
     { name = "mx-eye-protocol" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mx-eye-protocol", editable = "packages/protocol" }]
+requires-dist = [
+    { name = "mx-eye-protocol", editable = "packages/protocol" },
+    { name = "pydantic", specifier = ">=2,<3" },
+]
 
 [[package]]
 name = "pydantic"

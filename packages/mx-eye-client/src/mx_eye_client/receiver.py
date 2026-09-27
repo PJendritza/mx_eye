@@ -105,7 +105,7 @@ class Receiver(W.QWidget):
                     self.state.setText("Connected")
                 elif isinstance(reply, StatusSnapshot):
                     self.state.setText(f"{reply.state} · {reply.message}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report failures in the UI label
                 self.state.setText(str(exc))
             self.pending = None
         if (
@@ -146,8 +146,8 @@ class Receiver(W.QWidget):
         stats = self.client.stats
         last, count = self.last
         if now - last > 0.5:
-            self.rate = (stats["received"] - count) / (now - last)
-            self.last = (now, stats["received"])
+            self.rate = (stats.received - count) / (now - last)
+            self.last = (now, stats.received)
         sample = self.client.latest(max_age_ms=None, require_valid=False)
 
         def number(value):
@@ -164,10 +164,10 @@ class Receiver(W.QWidget):
                 f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.frame.payload.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
             )
         self.info.setText(
-            f"Clock {'synced' if stats['clock_synced'] else 'not synced'} · minimum RTT {number(stats['sync_rtt_ms'])} ms · packet gaps {stats['sequence_gaps']} · unprocessed source frames ≥{stats['acquisition_skips']} · buffer overwrites {stats['buffer_overwrites']}\nDelay is estimated from host read-return timestamps; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."
+            f"Clock {'synced' if stats.clock_synced else 'not synced'} · minimum RTT {number(stats.sync_rtt_ms)} ms · packet gaps {stats.sequence_gaps} · unprocessed source frames ≥{stats.acquisition_skips} · buffer overwrites {stats.buffer_overwrites}\nDelay is estimated from host read-return timestamps; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."
         )
-        if stats["error"]:
-            self.state.setText(stats["error"])
+        if stats.error:
+            self.state.setText(stats.error)
         if self.history:
             data = np.asarray(self.history)
             data = data[data[:, 0] >= time.perf_counter() - 8]

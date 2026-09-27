@@ -1,9 +1,11 @@
 """Typed control models and real TCP request-response integration tests."""
 
 import concurrent.futures
+import math
 import socket
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 
 import pytest
@@ -23,6 +25,7 @@ from mx_eye_protocol.control import (
 )
 from mx_eye_protocol.json_io import receive_json
 from py_mx_eye import Client
+from py_mx_eye.control import ClockSync, ControlClient
 from pydantic import ValidationError
 
 
@@ -146,13 +149,16 @@ def test_all_commands_share_endpoint(monkeypatch):
 
     service.submit = submit
     with running_server(service._dispatch_request) as server:
-        client = Client(control_port=server.server_address[1])
+        port = server.server_address[1]
+        client = Client(control_port=port)
         # This test isolates command transport from the separate sample stream.
         monkeypatch.setattr(client, "connect", lambda: client)
         assert client.start().state == "running"
         assert client.stop().state == "stopping"
         assert client.status().network.control_port == 5557
-        reply = client._rpc(Request(command=Command.SYNC, t1=123))
+        reply = ControlClient("127.0.0.1", port, 3.0).rpc(
+            Request(command=Command.SYNC, t1=123)
+        )
         assert reply.sync.t1 == 123
         assert reply.sync.t3 >= reply.sync.t2
         assert commands == [Command.START, Command.STOP]
@@ -227,12 +233,12 @@ def test_slow_start_does_not_block_sync():
 
     service.submit = submit
     with running_server(service._dispatch_request) as server:
-        client = Client(control_port=server.server_address[1], timeout=1)
+        control = ControlClient("127.0.0.1", server.server_address[1], 1.0)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            start = executor.submit(client._rpc, Request(command=Command.START))
+            start = executor.submit(control.rpc, Request(command=Command.START))
             try:
                 assert entered.wait(1)
-                sync = client._rpc(Request(command=Command.SYNC, t1=456))
+                sync = control.rpc(Request(command=Command.SYNC, t1=456))
                 assert sync.sync.t1 == 456
                 assert not start.done()
             finally:
@@ -243,19 +249,69 @@ def test_slow_start_does_not_block_sync():
 def test_background_clock_sync_uses_control_port():
     service = Service.__new__(Service)
     with running_server(service._dispatch_request) as server:
-        client = Client(control_port=server.server_address[1])
-        thread = threading.Thread(target=client._synchronize)
-        thread.start()
+        clock = ClockSync(ControlClient("127.0.0.1", server.server_address[1], 3.0))
+        clock.start()
         try:
             deadline = time.monotonic() + 2
-            while not client.stats["clock_synced"] and time.monotonic() < deadline:
-                client._stop.wait(0.005)
-            assert client.stats["clock_synced"]
-            assert client.stats["sync_rtt_ms"] >= 0
+            while not clock.synced and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert clock.synced
+            assert clock.rtt_ms >= 0
         finally:
-            client._stop.set()
-            thread.join(timeout=2)
-        assert not thread.is_alive()
+            clock.stop()
+
+
+class FakeControl:
+    """Return scripted four-timestamp probes, one per call."""
+
+    def __init__(self, probes):
+        self.probes = deque(probes)
+
+    def probe_timestamps(self, timeout):
+        return self.probes.popleft() if self.probes else None
+
+
+def test_clock_sync_keeps_the_lowest_rtt_probe():
+    clock = ClockSync(
+        FakeControl([(0, 1000, 1000, 1200), (0, 100, 100, 300), (0, 900, 900, 1800)]),
+        probes=3,
+        now=lambda: 1_000_000_000,
+    )
+    assert clock.run_once()
+    state = clock.state()
+    assert state.rtt_ms == 300 / 1e6
+    assert state.offset_ns == -50.0
+    assert state.valid_until_ns == 1_000_000_000 + 45_000_000_000
+    assert clock.synced
+
+
+def test_clock_sync_discards_unusable_probes():
+    assert not ClockSync(FakeControl([]), now=lambda: 0).run_once()
+    # A negative round trip and one above the 300 ms cap are both discarded.
+    unusable = [(100, 0, 0, 0), (0, 0, 0, 400_000_000)]
+    clock = ClockSync(FakeControl(unusable), probes=2, now=lambda: 0)
+    assert not clock.run_once()
+    assert not clock.synced
+    assert math.isnan(clock.rtt_ms)
+
+
+def test_clock_sync_expires_without_a_fresh_probe():
+    now = [0]
+    clock = ClockSync(FakeControl([(0, 0, 0, 0)]), probes=1, now=lambda: now[0])
+    assert clock.run_once()
+    assert clock.synced
+    now[0] = 45_000_000_000 + 1
+    assert not clock.synced
+    # The last round-trip measurement is reported even after the estimate expires.
+    assert clock.rtt_ms == 0.0
+
+
+def test_probe_swallows_transport_failures():
+    def refuse(address, timeout):
+        raise OSError("connection refused")
+
+    control = ControlClient("127.0.0.1", 1, 1.0, connect=refuse, now=lambda: 0)
+    assert control.probe_timestamps(0.3) is None
 
 
 def _free_port():
@@ -276,7 +332,8 @@ def test_service_status_reconfigure_and_shutdown():
         assert status.stats.acquired == 0
         assert status.network.control_port == config.value.network.control_port
         assert status.source.width == 0
-        assert client._rpc(Request(command=Command.SYNC, t1=7)).sync.t1 == 7
+        control = ControlClient("127.0.0.1", config.value.network.control_port, 3.0)
+        assert control.rpc(Request(command=Command.SYNC, t1=7)).sync.t1 == 7
 
         updated = cfg.MxEyeConfigStore(config.value.model_copy(deep=True))
         updated.value.network.control_port = _free_port()

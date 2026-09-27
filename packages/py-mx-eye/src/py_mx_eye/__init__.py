@@ -4,7 +4,8 @@ The SDK uses mx-eye-protocol and its Pydantic JSON models; importing it never
 loads Qt, OpenCV, or the tracker.
 """
 
-from .py_mx_eye import Client, Sample
+from .client import Client, Stats
+from .sample import Sample
 
 __version__ = "0.1.0"
-__all__ = ["Client", "Sample"]
+__all__ = ["Client", "Sample", "Stats"]

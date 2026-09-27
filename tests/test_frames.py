@@ -5,13 +5,14 @@ import io
 import math
 import multiprocessing
 import struct
+import time
 from dataclasses import replace
 
 import pytest
 from mx_eye.recording import TRACKING_COLUMNS, tracking_row
 from mx_eye_protocol import DataFrame, MessageType, TrackingFlags, TrackingPayload
-from py_mx_eye import Client, Sample
-from py_mx_eye._decoder import decode_frame, decode_header
+from py_mx_eye import Sample
+from py_mx_eye.receiver import decode_frame, decode_header
 
 HEADER = struct.Struct("<4sBI")
 
@@ -172,47 +173,67 @@ def test_measurements_and_validity(payload):
     assert not replace(frame, y=math.inf).valid
 
 
-def test_sample_timing_and_latest(payload, monkeypatch):
-    monkeypatch.setattr("py_mx_eye.py_mx_eye.time.perf_counter_ns", lambda: 10_000_000)
+def _timed_sample(payload):
     payload = replace(payload, acquisition_ns=2_000_000, send_ns=5_000_000)
     frame = DataFrame(message_type=MessageType.DATA, length=97, payload=payload)
-    sample = Sample(
+    return Sample(
         frame=frame,
         receive_ns=7_000_000,
         clock_offset_ns=1_000_000,
         clock_valid_until_ns=20_000_000,
         sync_rtt_ms=2,
     )
-    assert sample.frame is frame
-    assert sample.network_ms == 3
-    assert sample.arrival_age_ms == 6
-    assert sample.age_ms == 9
-    client = Client()
-    assert client.latest() is None
-    client._latest = sample
-    assert client.latest(max_age_ms=10) is sample
-    assert client.latest(max_age_ms=8) is None
-    client._latest = replace(
-        sample, frame=replace(frame, payload=replace(payload, flags=TrackingFlags.NONE))
-    )
-    assert client.latest() is None
-    assert client.latest(require_valid=False) is client._latest
-    client._latest = replace(
+
+
+def test_sample_timing(payload):
+    sample = _timed_sample(payload)
+    valid_now = time.perf_counter_ns() + 1_000_000_000
+    assert sample.frame.payload.send_ns == 5_000_000
+    assert sample.clock_valid_at(10_000_000)
+    # The properties evaluate against the process clock, which must be inside
+    # the sample's validity window for these numbers to be available.
+    assert replace(sample, clock_valid_until_ns=valid_now).network_ms == 3
+    assert replace(sample, clock_valid_until_ns=valid_now).arrival_age_ms == 6
+    assert sample.age_ms_at(10_000_000) == 9
+    assert sample.clock_valid_at(20_000_000)
+    assert not sample.clock_valid_at(20_000_001)
+    assert math.isnan(sample.age_ms_at(20_000_001))
+    unavailable = Sample(frame=sample.frame, receive_ns=7_000_000)
+    assert not unavailable.clock_valid
+    assert not unavailable.clock_valid_at(10_000_000)
+    assert math.isnan(unavailable.network_ms)
+    assert math.isnan(unavailable.arrival_age_ms)
+    assert math.isnan(unavailable.age_ms_at(10_000_000))
+
+
+def test_sample_freshness(payload):
+    sample = _timed_sample(payload)
+    # Age at 10 ms is 9 ms, so the 10 ms budget passes and the 8 ms budget does not.
+    assert sample.is_fresh_at(10_000_000, max_age_ms=10)
+    assert not sample.is_fresh_at(10_000_000, max_age_ms=8)
+    # None skips the age check only, not validity.
+    assert sample.is_fresh_at(20_000_001, max_age_ms=None)
+    lost = replace(
         sample,
-        frame=replace(frame, payload=replace(payload, acquisition_ns=13_000_000)),
+        frame=replace(
+            sample.frame,
+            payload=replace(sample.frame.payload, flags=TrackingFlags.NONE),
+        ),
     )
-    assert client.latest() is None
-    for unavailable in [
-        Sample(frame=frame, receive_ns=7_000_000),
-        replace(sample, clock_valid_until_ns=9_000_000),
-    ]:
-        assert not unavailable.clock_valid
-        assert math.isnan(unavailable.network_ms)
-        assert math.isnan(unavailable.arrival_age_ms)
-        assert math.isnan(unavailable.age_ms)
-        client._latest = unavailable
-        assert client.latest() is None
-        assert client.latest(max_age_ms=None) is unavailable
+    assert not lost.is_fresh_at(10_000_000, max_age_ms=10)
+    assert lost.is_fresh_at(10_000_000, max_age_ms=10, require_valid=False)
+    # An unsynchronized receiver has no age at all unless diagnostics waive both checks.
+    unsynced = replace(sample, clock_valid_until_ns=0)
+    assert not unsynced.is_fresh_at(10_000_000, max_age_ms=10)
+    assert unsynced.is_fresh_at(10_000_000, max_age_ms=None)
+    assert unsynced.is_fresh_at(10_000_000, max_age_ms=None, require_valid=False)
+    # A negative age is tolerated up to half the synchronization round trip.
+    early = replace(sample, clock_offset_ns=-1_000_000, sync_rtt_ms=10)
+    assert early.age_ms_at(1_000_000) == -2
+    assert early.is_fresh_at(1_000_000, max_age_ms=50)
+    assert not replace(early, sync_rtt_ms=2).is_fresh_at(1_000_000, max_age_ms=50)
+    # A missing round-trip estimate must not reject a readable age by itself.
+    assert replace(early, sync_rtt_ms=math.nan).is_fresh_at(1_000_000, max_age_ms=50)
 
 
 def _send_frame(queue, frame):

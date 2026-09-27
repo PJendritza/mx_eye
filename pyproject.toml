@@ -5,7 +5,10 @@ members = ['packages/*']
 testpaths = ['tests']
 
 [tool.pyright]
-include = ['packages/protocol/src/mx_eye_protocol']
+include = [
+    'packages/protocol/src/mx_eye_protocol',
+    'packages/py-mx-eye/src/py_mx_eye',
+]
 typeCheckingMode = 'strict'
 pythonVersion = '3.11'
 venvPath = '.'

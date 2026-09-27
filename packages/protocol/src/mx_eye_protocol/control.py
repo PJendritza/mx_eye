@@ -2,7 +2,7 @@
 
 from enum import StrEnum, auto
 from ipaddress import IPv4Address
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,7 +26,9 @@ class SourceMode(StrEnum):
 
 
 class ControlModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False
+    )
 
 
 class TrackingStats(ControlModel):

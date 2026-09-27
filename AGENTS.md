@@ -234,6 +234,28 @@ information. Use `sample.frame.payload` to access tracking fields.
 Recording queues carry TrackingPayload objects; the recording layer maps them to
 the unchanged CSV columns without binary float32 conversion.
 
+TrackingPayload flags use TrackingFlags (IntFlag); combine members with `|`.
+`TrackingFlags.NONE` means no flags. The former Packet type and flat Sample
+sampling attributes have been removed. Use `sample.frame.length` for encoded
+payload size and `sample.age_ms` for reception timing.
+TCP reception handles split and coalesced frames, rejecting unknown message
+types, reserved CMD frames and invalid DATA lengths before buffering their bodies.
+UDP uses the same binary envelope. Control JSON does not use that envelope.
+Enum values remain lowercase strings in JSON. Successful replies contain
+`ok: true` and either `status` or `sync`; failures contain `ok: false` and `error`.
+For example, a status request is `{"command":"status","protocol":"1.0.0"}`
+followed by a newline.
+
+## Type checking
+
+`mx-eye-protocol` ships inline type annotations and a PEP 561 `py.typed` marker
+in both wheels and source distributions. After installing workspace development
+dependencies, run `uv run pyright` from the repository root. Strict checking covers
+`packages/protocol/src/mx_eye_protocol` and targets Python 3.11; other workspace
+packages are outside this check. Use
+`uv run pyright --verifytypes mx_eye_protocol --ignoreexternal` to check public
+API type completeness without evaluating external dependencies.
+
 ## Delay readouts
 
 | Readout | Definition |

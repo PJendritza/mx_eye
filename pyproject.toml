@@ -4,7 +4,15 @@ members = ['packages/*']
 [tool.pytest.ini_options]
 testpaths = ['tests']
 
+[tool.pyright]
+include = ['packages/protocol/src/mx_eye_protocol']
+typeCheckingMode = 'strict'
+pythonVersion = '3.11'
+venvPath = '.'
+venv = '.venv'
+
 [dependency-groups]
 dev = [
+    "pyright>=1.1.414",
     "ruff>=0.16.9",
 ]

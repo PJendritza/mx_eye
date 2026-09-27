@@ -128,17 +128,25 @@ class Receiver(W.QWidget):
         now = time.monotonic()
         samples = self.client.drain()
         for sample in samples:
-            if sample.session != self.session or sample.coordinate_system != getattr(
-                self, "coordinate_system", None
+            if (
+                sample.frame.payload.session != self.session
+                or sample.frame.payload.coordinate_system
+                != getattr(self, "coordinate_system", None)
             ):
                 self.history.clear()
-                self.session = sample.session
-                self.coordinate_system = sample.coordinate_system
+                self.session = sample.frame.payload.session
+                self.coordinate_system = sample.frame.payload.coordinate_system
                 self.plot.setTitle(
-                    sample.coordinate_system.replace("_", " ") + " · pixels"
+                    sample.frame.payload.coordinate_system.replace("_", " ")
+                    + " · pixels"
                 )
             self.history.append(
-                (sample.receive_ns / 1e9, sample.x, sample.y, sample.arrival_age_ms)
+                (
+                    sample.receive_ns / 1e9,
+                    sample.frame.payload.x,
+                    sample.frame.payload.y,
+                    sample.arrival_age_ms,
+                )
             )
         stats = self.client.stats
         last, count = self.last
@@ -153,10 +161,12 @@ class Receiver(W.QWidget):
         if sample:
             stale = not math.isfinite(sample.age_ms) or sample.age_ms > 100
             validity = (
-                "STALE / UNSYNCED" if stale else ("VALID" if sample.valid else "LOST")
+                "STALE / UNSYNCED"
+                if stale
+                else ("VALID" if sample.frame.payload.valid else "LOST")
             )
             self.metrics.setText(
-                f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
+                f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.frame.payload.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
             )
         self.info.setText(
             f"Clock {'synced' if stats['clock_synced'] else 'not synced'} · minimum RTT {number(stats['sync_rtt_ms'])} ms · packet gaps {stats['sequence_gaps']} · unprocessed source frames ≥{stats['acquisition_skips']} · buffer overwrites {stats['buffer_overwrites']}\nDelay is estimated from host read-return timestamps; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."

@@ -45,7 +45,7 @@ with Client("127.0.0.1") as eye:
     # Inside your behavioral-task loop:
     sample = eye.latest(max_age_ms=50)
     if sample is not None:
-        x, y = sample.x, sample.y
+        x, y = sample.frame.payload.x, sample.frame.payload.y
     # At the end of the session:
     eye.stop()
 ```
@@ -53,3 +53,30 @@ with Client("127.0.0.1") as eye:
 `latest()` returns None until tracking and clock synchronization are ready, and
 coordinates are uncalibrated source-image pixels. A runnable example:
 `uv run python -m mx_eye_client.receive_minimal`. More detail in AGENTS.md.
+
+Sampling fields are defined once by `mx_eye_protocol.TrackingPayload`.
+`TrackingPayload.flags` uses `TrackingFlags` (`IntFlag`), for example
+`TrackingFlags.VALID | TrackingFlags.PUPIL`; `TrackingFlags.NONE` means no flags.
+`DataFrame` wraps that payload with `magic`, `message_type`, and `length`.
+Both dataclasses live in `mx_eye_protocol/data_frame.py`.
+The SDK returns `Sample(frame=..., receive_ns=..., ...)`: use
+`sample.frame.payload.x` and `sample.frame.payload.valid` for tracking data,
+`sample.frame.length` for encoded payload size, and `sample.age_ms` for reception timing.
+The former `Packet` type and flat `Sample` sampling attributes have been removed.
+
+The binary header is little-endian `<4sBI`: magic `MXEY`, message type
+(`DATA=1`, `CMD=2`), and a uint32 payload byte count excluding the header.
+The DATA payload is `<7Qq8fB` (97 bytes); its flags are the final byte.
+A DATA frame is therefore 106 bytes. `DataFrame.from_payload(payload)` builds
+its header; `frame.encode()` serializes it without protocol validation, and
+`frame.frame_size` reports header size plus declared payload length.
+Decoding and incoming-header validation belong to the receiver; the SDK implements
+them in its private `_decoder.py` module. TCP reception reads the header before
+waiting for the declared payload, handling split and coalesced frames.
+Invalid headers disconnect the TCP stream; invalid UDP datagrams are dropped.
+Unknown types, unsupported CMD frames, and invalid DATA lengths are rejected
+before buffering their declared bodies.
+
+This replaces the former 104-byte v1 sample protocol: update tracker and SDK
+together. UDP samples use the same new envelope. Recording CSV columns and
+precision are unchanged. The binary CMD type remains reserved.

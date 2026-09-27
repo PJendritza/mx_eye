@@ -14,15 +14,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 import psutil
-from mx_eye_protocol.packets import (
-    CR,
-    PUPIL,
-    PUPIL_ONLY,
-    ROI_RELATIVE,
-    SIMULATION,
-    VALID,
-    Packet,
-    encode,
+from mx_eye_protocol.data_frame import (
+    DataFrame,
+    TrackingFlags,
+    TrackingPayload,
 )
 
 from .config import (
@@ -33,6 +28,7 @@ from .config import (
     TrackingMode,
     Transport,
 )
+from .recording import TRACKING_COLUMNS, tracking_row
 from .tracking import Tracker
 from .transport import Publisher
 from .video import VideoReader
@@ -512,28 +508,21 @@ def tracking_worker(
                 seq += 1
                 pupil, cr = result["pupil"], result["cr"]
                 nan = float("nan")
-                flags = (
-                    (VALID if result["valid"] else 0)
-                    | (PUPIL if pupil else 0)
-                    | (CR if cr else 0)
-                )
-                flags |= (
-                    PUPIL_ONLY
-                    if core.config.tracking_mode is TrackingMode.PUPIL_ONLY
-                    else 0
-                )
-                if (
-                    flags & PUPIL_ONLY
-                    and core.config.pupil_coordinates is PupilCoordinates.RELATIVE
-                ):
-                    flags |= ROI_RELATIVE
-                flags |= (
-                    SIMULATION
-                    if config.value.source.mode is SourceMode.SIMULATION
-                    else 0
-                )
+                flags = TrackingFlags.NONE
+                if result["valid"]:
+                    flags |= TrackingFlags.VALID
+                if pupil:
+                    flags |= TrackingFlags.PUPIL
+                if cr:
+                    flags |= TrackingFlags.CR
+                if core.config.tracking_mode is TrackingMode.PUPIL_ONLY:
+                    flags |= TrackingFlags.PUPIL_ONLY
+                    if core.config.pupil_coordinates is PupilCoordinates.RELATIVE:
+                        flags |= TrackingFlags.ROI_RELATIVE
+                if config.value.source.mode is SourceMode.SIMULATION:
+                    flags |= TrackingFlags.SIMULATION
                 send = time.perf_counter_ns()
-                packet = Packet(
+                payload = TrackingPayload(
                     session=session,
                     sequence=seq,
                     frame=frame_id,
@@ -552,7 +541,7 @@ def tracking_worker(
                     template_ncc=result["template_score"],
                     flags=flags,
                 )
-                data = encode(packet)
+                data = DataFrame.from_payload(payload).encode()
                 try:
                     if pub is not None:
                         stats["send_errors"].value += pub.send(data)
@@ -562,7 +551,7 @@ def tracking_worker(
                     stats["send_errors"].value += 1
                 if samples is not None:
                     try:
-                        samples.put_nowait((*packet.body(), packet.flags))
+                        samples.put_nowait(payload)
                     except queue.Full:
                         if not stats["log_fault"].value:
                             report(
@@ -673,32 +662,12 @@ def writer_worker(
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
         fw, sw = csv.writer(frame_file), csv.writer(sample_file)
         fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns"])
-        sw.writerow(
-            [
-                "session",
-                "sequence",
-                "source_frame",
-                "acquisition_ns",
-                "tracking_start_ns",
-                "tracking_end_ns",
-                "send_ns",
-                "media_ns",
-                "x",
-                "y",
-                "pupil_x",
-                "pupil_y",
-                "cr_x",
-                "cr_y",
-                "pupil_area",
-                "template_ncc",
-                "flags",
-            ]
-        )
+        sw.writerow(TRACKING_COLUMNS)
         report(events, "writer_ready")
         while True:
             for _ in range(256):
                 try:
-                    sw.writerow(samples.get_nowait())
+                    sw.writerow(tracking_row(samples.get_nowait()))
                 except queue.Empty:
                     break
             item = ring.get(timeout=0.01)

@@ -17,7 +17,7 @@ with Client(TRACKER_IP) as eye:
             if sample is not None:
                 # Pixel signal: pupil minus CR, or pupil coordinates in pupil-only mode.
                 print(
-                    f"x={sample.x:7.2f}  y={sample.y:7.2f}  age≈{sample.age_ms:5.2f} ms"
+                    f"x={sample.frame.payload.x:7.2f}  y={sample.frame.payload.y:7.2f}  age≈{sample.age_ms:5.2f} ms"
                 )
             time.sleep(0.02)
     except KeyboardInterrupt:

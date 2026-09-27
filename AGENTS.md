@@ -24,7 +24,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
   transmitted and recorded X/Y. Pupil + CR remains pupil minus CR. A moving ROI
   changes the relative origin; this is not calibrated gaze or full head-motion
   compensation. Raw pupil_x/pupil_y remain absolute. The SDK exposes
-  `sample.coordinate_system`; packet/CSV flag bit 32 marks ROI-relative output.
+  `sample.frame.payload.coordinate_system`; packet/CSV flag bit 32 marks ROI-relative output.
 - **Video navigation:** Left/Right arrows pause and step one frame backward/forward.
   Parameter editors keep their normal arrow-key behavior. Click anywhere on the
   timeline to seek immediately, or drag and release. Play/Pause changes its label
@@ -199,15 +199,31 @@ instead of being resolved at run time.
 Reconnect clients after changing transport/ports. The protocol is unauthenticated
 and intended for a trusted lab network, not an exposed internet service.
 
-TCP uses fixed-size binary framing, disables Nagle, and never waits for slow
+Sample TCP uses length-prefixed binary framing, disables Nagle, and never waits for slow
 receivers: a partial/blocked send disconnects that receiver, which reconnects.
 UDP can lose/reorder datagrams. Both include a session ID, sample sequence, and
 source-frame ID. The SDK rejects out-of-order samples, resets on a new session,
 and reports sequence gaps. Neither mode guarantees delivery of every sample.
 
-This is a new versioned `MXEY` protocol (104-byte packets), not wire-compatible
-with the older `eye_sender_switchable_v4.py` experiment. Use the included SDK.
-`packages/protocol/src/mx_eye_protocol/packets.py` specifies byte layout and flags.
+The sample frame header is little-endian `<4sBI`: magic `MXEY`, message type
+(`DATA=1`, `CMD=2`), and uint32 encoded payload length (excluding the header).
+DATA carries a 97-byte `<7Qq8fB` TrackingPayload; the full frame is 106 bytes.
+It replaces the old 104-byte v1 protocol and is not compatible with the earlier
+`eye_sender_switchable_v4.py` experiment. Update tracker and SDK together.
+TCP validates the header before buffering the declared payload and disconnects
+on malformed headers; UDP drops malformed datagrams. Only DATA is implemented;
+the binary CMD type is reserved.
+
+`packages/protocol/src/mx_eye_protocol/data_frame.py` defines TrackingPayload,
+DataFrame and flags. DataFrame contains magic, message_type, length and payload;
+DataFrame owns the shared binary layout and exposes `from_payload()`, `encode()`
+and the `frame_size` property. Encoding does not validate the header.
+`DataFrame.header_size` is the stream header length. The SDK implements decoding
+and incoming-header validation in `py_mx_eye/_decoder.py`.
+The SDK Sample contains the complete frame plus reception and clock synchronization
+information. Use `sample.frame.payload` to access tracking fields.
+Recording queues carry TrackingPayload objects; the recording layer maps them to
+the unchanged CSV columns without binary float32 conversion.
 
 ## Delay readouts
 

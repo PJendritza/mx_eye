@@ -20,7 +20,9 @@ from mx_eye_protocol.control import (
     Reply,
     Request,
 )
-from mx_eye_protocol.packets import PACKET, PUPIL_ONLY, ROI_RELATIVE, VALID, decode
+from mx_eye_protocol.data_frame import DataFrame
+
+from ._decoder import decode_frame, decode_header
 
 
 # Client-side copy of the framed-JSON control helpers; the tracker keeps its own
@@ -43,98 +45,48 @@ def send_json(sock, obj):
 
 @dataclass(frozen=True)
 class Sample:
-    session: int
-    sequence: int
-    frame: int
-    acquisition_ns: int
-    tracking_start_ns: int
-    tracking_end_ns: int
-    send_ns: int
-    media_ns: int
-    x: float
-    y: float
-    pupil_x: float
-    pupil_y: float
-    cr_x: float
-    cr_y: float
-    pupil_area: float
-    template_ncc: float
-    flags: int
+    """A received DATA frame with receiver-local timing information."""
+
+    frame: DataFrame
     receive_ns: int
     clock_offset_ns: float = math.nan  # server minus receiver
     clock_valid_until_ns: int = 0
     sync_rtt_ms: float = math.nan
 
-    @classmethod
-    def from_packet(
-        cls,
-        packet,
-        receive_ns,
-        clock_offset_ns=math.nan,
-        clock_valid_until_ns=0,
-        sync_rtt_ms=math.nan,
-    ):
-        return cls(
-            *packet.body(),
-            packet.flags,
-            receive_ns,
-            clock_offset_ns,
-            clock_valid_until_ns,
-            sync_rtt_ms,
-        )
-
     @property
-    def valid(self):
-        return (
-            bool(self.flags & VALID) and math.isfinite(self.x) and math.isfinite(self.y)
-        )
-
-    @property
-    def coordinate_system(self):
-        if not self.flags & PUPIL_ONLY:
-            return "pupil_minus_cr"
-        return "roi_relative" if self.flags & ROI_RELATIVE else "image_absolute"
-
-    @property
-    def processing_ms(self):
-        return (self.tracking_end_ns - self.tracking_start_ns) / 1e6
-
-    @property
-    def acquisition_to_send_ms(self):
-        return (self.send_ns - self.acquisition_ns) / 1e6
-
-    @property
-    def queue_ms(self):
-        return (self.tracking_start_ns - self.acquisition_ns) / 1e6
-
-    @property
-    def clock_valid(self):
+    def clock_valid(self) -> bool:
         return (
             math.isfinite(self.clock_offset_ns)
             and time.perf_counter_ns() <= self.clock_valid_until_ns
         )
 
     @property
-    def network_ms(self):
+    def network_ms(self) -> float:
         return (
-            (self.receive_ns - self.send_ns + self.clock_offset_ns) / 1e6
+            (self.receive_ns - self.frame.payload.send_ns + self.clock_offset_ns) / 1e6
             if self.clock_valid
             else math.nan
         )
 
     @property
-    def arrival_age_ms(self):
+    def arrival_age_ms(self) -> float:
         return (
-            (self.receive_ns - self.acquisition_ns + self.clock_offset_ns) / 1e6
+            (self.receive_ns - self.frame.payload.acquisition_ns + self.clock_offset_ns)
+            / 1e6
             if self.clock_valid
             else math.nan
         )
 
     @property
-    def age_ms(self):
+    def age_ms(self) -> float:
         """Age now, including time the sample has waited in the user's code."""
         return (
-            (time.perf_counter_ns() - self.acquisition_ns + self.clock_offset_ns) / 1e6
+            (
+                time.perf_counter_ns()
+                - self.frame.payload.acquisition_ns
+                + self.clock_offset_ns
+            )
+            / 1e6
             if self.clock_valid
             else math.nan
         )
@@ -235,7 +187,7 @@ class Client:
     def latest(self, max_age_ms=50.0, require_valid=True):
         with self._lock:
             sample = self._latest
-        if sample is None or (require_valid and not sample.valid):
+        if sample is None or (require_valid and not sample.frame.payload.valid):
             return None
         if max_age_ms is not None:
             age = sample.age_ms
@@ -284,7 +236,22 @@ class Client:
                             sock = None
                             self._stop.wait(0.1)
                             continue
-                    if len(pending) < PACKET.size:
+                    size = None
+                    if len(pending) >= DataFrame.header_size:
+                        try:
+                            _, _, length = decode_header(
+                                bytes(pending[: DataFrame.header_size])
+                            )
+                            size = DataFrame.header_size + length
+                        except ValueError:
+                            with self._lock:
+                                self._stats["malformed"] += 1
+                            # An invalid header loses the stream boundary.
+                            sock.close()
+                            sock = None
+                            pending.clear()
+                            continue
+                    if size is None or len(pending) < size:
                         try:
                             chunk = sock.recv(65536)
                             if not chunk:
@@ -296,11 +263,9 @@ class Client:
                             sock.close()
                             sock = None
                             pending.clear()
-                            continue
-                    if len(pending) < PACKET.size:
                         continue
-                    data = bytes(pending[: PACKET.size])
-                    del pending[: PACKET.size]
+                    data = bytes(pending[:size])
+                    del pending[:size]
                 else:
                     try:
                         data, _ = sock.recvfrom(2048)
@@ -308,13 +273,17 @@ class Client:
                         continue
                 received = time.perf_counter_ns()
                 try:
-                    packet = decode(data)
+                    data_frame = decode_frame(data)
                 except ValueError:
                     with self._lock:
                         self._stats["malformed"] += 1
                     continue
                 with self._lock:
-                    session, seq, frame = packet.session, packet.sequence, packet.frame
+                    session, seq, frame = (
+                        data_frame.payload.session,
+                        data_frame.payload.sequence,
+                        data_frame.payload.frame,
+                    )
                     if session != self._session:
                         if session in self._old_sessions:
                             continue
@@ -334,7 +303,13 @@ class Client:
                         )
                     self._sequence, self._frame = seq, frame
                     offset, expiry, rtt = self._clock
-                    sample = Sample.from_packet(packet, received, offset, expiry, rtt)
+                    sample = Sample(
+                        frame=data_frame,
+                        receive_ns=received,
+                        clock_offset_ns=offset,
+                        clock_valid_until_ns=expiry,
+                        sync_rtt_ms=rtt,
+                    )
                     if len(self._samples) == self._samples.maxlen:
                         self._stats["buffer_overwrites"] += 1
                     self._samples.append(sample)

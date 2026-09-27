@@ -1,21 +1,21 @@
 """Shared wire formats between the mx-eye tracker and the mx-eye SDK.
 
-This package holds the versioned wire contract only: the binary packet layout
-and the control-plane messages. It depends on the standard library alone and
+This package holds tracking data models, their binary codec,
+and the control-plane messages. JSON models use Pydantic, and this package
 must not import Qt, OpenCV, or the tracker.
 """
 
 from .control import (
-    CMD_START,
-    CMD_STATUS,
-    CMD_STOP,
-    CMD_SYNC,
-    CONTROL_COMMANDS,
-    PROTOCOL_VERSION,
-    SYNC_COMMANDS,
+    ClockSync,
+    Command,
+    NetworkStatus,
     Reply,
     Request,
+    SourceMode,
+    SourceStatus,
     StatusSnapshot,
+    TrackingStats,
+    Transport,
 )
 from .data_frame import (
     DataFrame,
@@ -26,18 +26,18 @@ from .data_frame import (
 
 __version__ = "0.1.0"
 __all__ = [
+    "ClockSync",
+    "Command",
     "DataFrame",
     "MessageType",
-    "TrackingFlags",
-    "TrackingPayload",
-    "CMD_START",
-    "CMD_STATUS",
-    "CMD_STOP",
-    "CMD_SYNC",
-    "CONTROL_COMMANDS",
-    "PROTOCOL_VERSION",
-    "SYNC_COMMANDS",
+    "NetworkStatus",
     "Reply",
     "Request",
+    "SourceMode",
+    "SourceStatus",
     "StatusSnapshot",
+    "TrackingFlags",
+    "TrackingPayload",
+    "TrackingStats",
+    "Transport",
 ]

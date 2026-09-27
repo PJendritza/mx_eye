@@ -1,129 +1,121 @@
-"""Control-plane messages shared by the tracker service and the SDK.
+"""Typed JSON requests and responses for the single command TCP endpoint."""
 
-Framing stays in the transport layer; these models only describe the JSON
-payloads exchanged on the control and sync ports.
-"""
+from enum import StrEnum, auto
+from ipaddress import IPv4Address
+from typing import Literal
 
-from dataclasses import dataclass, field
-
-PROTOCOL_VERSION = 1
-
-CMD_STATUS = "status"
-CMD_START = "start"
-CMD_STOP = "stop"
-CMD_SYNC = "sync"
-CONTROL_COMMANDS = (CMD_STATUS, CMD_START, CMD_STOP)
-SYNC_COMMANDS = (CMD_SYNC,)
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-@dataclass(frozen=True)
-class StatusSnapshot:
-    """Flat status payload sent on the control port and shown by the GUI."""
+class Command(StrEnum):
+    STATUS = auto()
+    START = auto()
+    STOP = auto()
+    SYNC = auto()
 
+
+class Transport(StrEnum):
+    TCP = auto()
+    UDP = auto()
+
+
+class SourceMode(StrEnum):
+    CAMERA = auto()
+    VIDEO = auto()
+    SIMULATION = auto()
+
+
+class ControlModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+
+class TrackingStats(ControlModel):
+    """Counters and measurements reported by the tracking service."""
+
+    acquired: int = 0
+    tracked: int = 0
+    written: int = 0
+    enqueued: int = 0
+    tracking_skips: int = 0
+    mailbox_misses: int = 0
+    record_fault: int = 0
+    log_fault: int = 0
+    capture_fault: int = 0
+    tracking_fault: int = 0
+    send_errors: int = 0
+    source_fps: float = 0.0
+    source_index: int = 0  # Zero-based media frame index.
+    processing_us: float = 0.0  # Most recent tracking duration, microseconds.
+
+
+class NetworkStatus(ControlModel):
+    bind: IPv4Address = IPv4Address("127.0.0.1")
+    data_port: int = 5556
+    control_port: int = 5557
+    transport: Transport = Transport.TCP
+    udp_host: IPv4Address = IPv4Address("127.0.0.1")
+
+
+class SourceStatus(ControlModel):
+    mode: SourceMode | None = None
+    fps: float = 0.0
+    total: int = 0  # Estimated video frame count until total_exact becomes true.
+    total_exact: bool = False
+    width: int = 0
+    height: int = 0
+    actual_format: str = "unknown format"
+    driver_fps: float | None = None
+    requested_format: str = ""
+    requested_fps: float = 0.0
+
+
+class StatusSnapshot(ControlModel):
     state: str
     message: str = ""
     paused: bool = False
-    session: int = None
-    stats: dict = field(default_factory=dict)
+    session: int | None = None
+    stats: TrackingStats = Field(default_factory=TrackingStats)
     directory: str = ""
-    network: dict = field(default_factory=dict)
-    source: dict = field(default_factory=dict)
-    priority: list = field(default_factory=list)
-    server_errors: list = field(default_factory=list)
-    protocol: int = PROTOCOL_VERSION
-    ok: bool = True
-
-    def to_dict(self):
-        return dict(
-            ok=self.ok,
-            protocol=self.protocol,
-            state=self.state,
-            message=self.message,
-            paused=self.paused,
-            session=self.session,
-            stats=dict(self.stats),
-            directory=self.directory,
-            network=dict(self.network),
-            source=dict(self.source),
-            priority=list(self.priority),
-            server_errors=list(self.server_errors),
-        )
-
-    @classmethod
-    def from_dict(cls, data):
-        return cls(
-            state=data.get("state", ""),
-            message=data.get("message", ""),
-            paused=bool(data.get("paused", False)),
-            session=data.get("session"),
-            stats=dict(data.get("stats") or {}),
-            directory=data.get("directory", ""),
-            network=dict(data.get("network") or {}),
-            source=dict(data.get("source") or {}),
-            priority=list(data.get("priority") or []),
-            server_errors=list(data.get("server_errors") or []),
-            protocol=data.get("protocol", PROTOCOL_VERSION),
-            ok=bool(data.get("ok", True)),
-        )
+    network: NetworkStatus = Field(default_factory=NetworkStatus)
+    source: SourceStatus = Field(default_factory=SourceStatus)
+    priority: list[str] = Field(default_factory=list)
+    server_errors: list[str] = Field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class Request:
-    """One request on the control (status/start/stop) or sync port."""
+class Request(ControlModel):
+    command: Command
+    protocol: Literal["1.0.0"] = "1.0.0"  # Supported control protocol SemVer.
+    t1: int | None = Field(default=None, strict=True, ge=0)  # Client send time, ns.
 
-    command: str
-    protocol: int = PROTOCOL_VERSION
-    t1: int = None  # sync probes only
-
-    def to_dict(self):
-        out = dict(protocol=self.protocol, command=self.command)
-        if self.t1 is not None:
-            out["t1"] = self.t1
-        return out
-
-    @classmethod
-    def from_dict(cls, data):
-        if not isinstance(data, dict):
-            raise ValueError("Malformed control request")
-        command = data.get("command")
-        if not isinstance(command, str) or not command:
-            raise ValueError("Missing control command")
-        t1 = data.get("t1")
-        if command == CMD_SYNC and t1 is None:
-            raise ValueError("Sync request must carry t1")
-        return cls(command=command, protocol=data.get("protocol"), t1=t1)
+    @model_validator(mode="after")
+    def validate_sync_timestamp(self) -> "Request":
+        if (self.command is Command.SYNC) != (self.t1 is not None):
+            raise ValueError("Only sync requests must carry t1")
+        return self
 
 
-@dataclass(frozen=True)
-class Reply:
-    """One reply; exactly one of status, the sync timestamps, or error is set."""
+class ClockSync(ControlModel):
+    """Four-timestamp synchronization; the client records t4 on receipt."""
+
+    t1: int = Field(strict=True, ge=0)  # Echo of the client monotonic send time, ns.
+    t2: int = Field(strict=True, ge=0)  # Server monotonic receive time, ns.
+    t3: int = Field(strict=True, ge=0)  # Server monotonic time before replying, ns.
+
+
+class Reply(ControlModel):
+    """One response: a status snapshot, clock timestamps, or an error."""
 
     ok: bool = True
-    error: str = ""
-    t1: int = None
-    t2: int = None
-    t3: int = None
-    status: StatusSnapshot = None
+    status: StatusSnapshot | None = None
+    sync: ClockSync | None = None
+    error: str | None = None
 
-    def to_dict(self):
-        if self.status is not None:
-            return self.status.to_dict()
-        out = dict(ok=self.ok)
-        if not self.ok:
-            out["error"] = self.error
-            return out
-        for key in ("t1", "t2", "t3"):
-            value = getattr(self, key)
-            if value is not None:
-                out[key] = value
-        return out
-
-    @classmethod
-    def from_dict(cls, data):
-        if not isinstance(data, dict):
-            raise ValueError("Malformed control reply")
-        if not data.get("ok"):
-            return cls(ok=False, error=str(data.get("error", "")))
-        if "state" in data:
-            return cls(ok=True, status=StatusSnapshot.from_dict(data))
-        return cls(ok=True, t1=data.get("t1"), t2=data.get("t2"), t3=data.get("t3"))
+    @model_validator(mode="after")
+    def validate_result(self) -> "Reply":
+        results = int(self.status is not None) + int(self.sync is not None)
+        if self.ok:
+            if results != 1 or self.error is not None:
+                raise ValueError("A successful reply must contain exactly one result")
+        elif results or not self.error:
+            raise ValueError("A failed reply must contain only an error message")
+        return self

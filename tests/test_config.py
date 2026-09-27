@@ -47,8 +47,8 @@ def test_assignment_rejects_invalid_fields(group, key, value):
 
 def test_validation_rejects_cross_field_errors():
     duplicate_ports = cfg.MxEyeConfigStore.defaults().value.model_dump()
-    duplicate_ports["network"]["sync_port"] = duplicate_ports["network"]["data_port"]
-    with pytest.raises(ValidationError, match="three distinct ports"):
+    duplicate_ports["network"]["control_port"] = duplicate_ports["network"]["data_port"]
+    with pytest.raises(ValidationError, match="two distinct ports"):
         cfg.MxEyeConfigModel.model_validate(duplicate_ports)
 
     reversed_areas = cfg.MxEyeConfigStore.defaults().value.model_dump()

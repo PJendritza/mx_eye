@@ -14,12 +14,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--data-port", type=int, default=5556)
     parser.add_argument("--control-port", type=int, default=5557)
-    parser.add_argument("--sync-port", type=int, default=5558)
     args = parser.parse_args()
     app = W.QApplication.instance() or W.QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
-    window = Receiver(args.host, args.data_port, args.control_port, args.sync_port)
+    window = Receiver(args.host, args.data_port, args.control_port)
     window.show()
     return app.exec()
 

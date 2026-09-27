@@ -53,7 +53,6 @@ class Settings(W.QDialog):
                     ),
                     ("data_port", "Sample port", 1024, 65535),
                     ("control_port", "Command port", 1024, 65535),
-                    ("sync_port", "Clock-sync port", 1024, 65535),
                     ("udp_host", "UDP receiver address", None),
                 ],
             ),
@@ -805,12 +804,12 @@ class Window(W.QMainWindow):
                 else "Live camera · full video is recorded during each session"
             )
         )
-        if mode is SourceMode.CAMERA and state.source.get("width"):
+        if mode is SourceMode.CAMERA and state.source.width:
             info = state.source
             name = f"Camera {self.camera.value()}"
-            camera_mode = f"{info['width']} × {info['height']} · {info.get('actual_format', 'unknown format')}"
-            if info.get("driver_fps") is not None:
-                camera_mode += f" · driver {info['driver_fps']:g} fps"
+            camera_mode = f"{info.width} × {info.height} · {info.actual_format}"
+            if info.driver_fps is not None:
+                camera_mode += f" · driver {info.driver_fps:g} fps"
             self.source_label.setText(
                 f"{name} · {camera_mode} · full video is recorded"
             )
@@ -864,31 +863,29 @@ class Window(W.QMainWindow):
         last, a, t = self.rate_last
         if now - last >= 0.5:
             self.rates = (
-                (stats.get("acquired", 0) - a) / (now - last),
-                (stats.get("tracked", 0) - t) / (now - last),
+                (stats.acquired - a) / (now - last),
+                (stats.tracked - t) / (now - last),
             )
-            self.rate_last = (now, stats.get("acquired", 0), stats.get("tracked", 0))
-        backlog = int(stats.get("enqueued", 0) - stats.get("written", 0))
+            self.rate_last = (now, stats.acquired, stats.tracked)
+        backlog = int(stats.enqueued - stats.written)
         recording = (
             "FAULT — INCOMPLETE"
-            if stats.get("record_fault")
+            if stats.record_fault
             else (
-                f"{int(stats.get('written', 0))} frames · buffer {backlog}"
+                f"{int(stats.written)} frames · buffer {backlog}"
                 if state.directory
                 else "off"
             )
         )
-        if stats.get("log_fault"):
+        if stats.log_fault:
             recording += " · LOG INCOMPLETE"
         self.metrics.setText(
-            f"ACQ  {self.rates[0]:.1f} fps     TRACK  {self.rates[1]:.1f} fps     PROC  {stats.get('processing_us', 0) / 1000:.2f} ms     SKIPPED  {int(stats.get('tracking_skips', 0))}     VIDEO  {recording}"
+            f"ACQ  {self.rates[0]:.1f} fps     TRACK  {self.rates[1]:.1f} fps     PROC  {stats.processing_us / 1000:.2f} ms     SKIPPED  {int(stats.tracking_skips)}     VIDEO  {recording}"
         )
         self.metrics.setStyleSheet(
-            "color:#ff817f;"
-            if stats.get("record_fault") or stats.get("log_fault")
-            else ""
+            "color:#ff817f;" if stats.record_fault or stats.log_fault else ""
         )
-        self.timeline.setMaximum(max(1, state.source.get("total", 1) - 1))
+        self.timeline.setMaximum(max(1, state.source.total - 1))
         payload = self.service.preview()
         fresh_payload = payload is not None
         if payload:

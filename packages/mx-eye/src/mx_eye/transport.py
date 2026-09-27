@@ -1,23 +1,6 @@
-"""Bounded standard-library TCP/UDP transport, including framed JSON control."""
+"""Bounded standard-library transport for tracking samples."""
 
-import json
 import socket
-
-
-def receive_json(sock):
-    data = bytearray()
-    while b"\n" not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Peer closed before replying")
-        data.extend(chunk)
-        if len(data) > 16384:
-            raise ValueError("Control message is too large")
-    return json.loads(data.split(b"\n", 1)[0])
-
-
-def send_json(sock, obj):
-    sock.sendall(json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n")
 
 
 def listen(host, port):

@@ -176,8 +176,7 @@ No gaze calibration or neural eye-region detector is included in this first vers
 
 The SDK is the `py-mx-eye` workspace member; it is not published to PyPI yet, so use it
 from a checkout (`uv sync --all-extras`) or install the wheels built by `uv build` for
-`py-mx-eye` and `mx-eye-protocol`. It depends only on the standard library and
-`mx-eye-protocol`, and never loads Qt or OpenCV.
+`py-mx-eye` and `mx-eye-protocol`. It uses `mx-eye-protocol` and its Pydantic JSON models, and never loads Qt or OpenCV.
 
 ## Networking
 
@@ -186,8 +185,7 @@ Defaults are local-machine only:
 | Purpose | Transport | Port |
 |---|---|---:|
 | Tracking samples | TCP, optionally UDP | 5556 |
-| Start/stop/status | TCP | 5557 |
-| Clock synchronization | TCP | 5558 |
+| Start/stop/status and clock synchronization | TCP | 5557 |
 
 For separate computers: set tracker bind address to `0.0.0.0`, use its LAN IP in
 `Client(...)` or `uv run mx-eye-receiver --host TRACKER_IP`, and allow the
@@ -212,7 +210,18 @@ It replaces the old 104-byte v1 protocol and is not compatible with the earlier
 `eye_sender_switchable_v4.py` experiment. Update tracker and SDK together.
 TCP validates the header before buffering the declared payload and disconnects
 on malformed headers; UDP drops malformed datagrams. Only DATA is implemented;
-the binary CMD type is reserved.
+The binary CMD type is reserved. All commands, including sync, use newline-delimited
+JSON on the single control port. The TCP server handles concurrent connections,
+each with one request and one response followed by connection closure.
+Request, Reply and nested status fields are Pydantic models. Command, Transport
+and SourceMode use StrEnum with auto(); configuration reuses the same enums.
+The control protocol version is the SemVer string `1.0.0`; other versions,
+including legacy integers, are rejected. Packages require Python 3.11 or newer.
+Replies contain either a nested status, sync timestamps, or an error.
+SDK start/stop/status return StatusSnapshot with field access such as
+`status.network.transport` and `status.stats.tracked`.
+Remove legacy `sync_port` configuration/client arguments and `--sync-port`;
+old flat status responses are no longer supported. Update both endpoints together.
 
 `packages/protocol/src/mx_eye_protocol/data_frame.py` defines TrackingPayload,
 DataFrame and flags. DataFrame contains magic, message_type, length and payload;
@@ -235,7 +244,7 @@ the unchanged CSV columns without binary float32 conversion.
 | Arrival age | Receiver receipt minus acquisition, after correction |
 | Age now | Current receiver time minus acquisition, after correction |
 
-A dedicated server performs four-timestamp synchronization. The SDK takes eight
+The command server performs four-timestamp synchronization on the same port. The SDK takes eight
 probes, selects the lowest round-trip time, and repeats every 15 seconds. The
 estimate expires after 45 seconds without a successful sync. This works with
 separate monotonic clocks and does not assume identical boot times or wall clocks.
@@ -268,4 +277,3 @@ Reference documentation: [Python multiprocessing](https://docs.python.org/3/libr
 [OpenCV camera/video I/O](https://docs.opencv.org/4.x/d8/dfe/classcv_1_1VideoCapture.html),
 [OpenCV VideoWriter](https://docs.opencv.org/4.x/dd/d9e/classcv_1_1VideoWriter.html),
 [Qt threads](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThread.html).
-

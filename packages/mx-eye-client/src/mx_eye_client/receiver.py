@@ -7,6 +7,7 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
+from mx_eye_protocol.control import StatusSnapshot
 from py_mx_eye import Client
 from PySide6 import QtCore as C
 from PySide6 import QtWidgets as W
@@ -15,10 +16,10 @@ from .style import label
 
 
 class Receiver(W.QWidget):
-    def __init__(self, host, data_port, control_port, sync_port):
+    def __init__(self, host, data_port, control_port):
         super().__init__()
         self.client = None
-        self.ports = (data_port, control_port, sync_port)
+        self.ports = (data_port, control_port)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.pending = None
         self.history = deque(maxlen=4000)
@@ -99,17 +100,11 @@ class Receiver(W.QWidget):
         if self.pending and self.pending.done():
             try:
                 reply = self.pending.result()
-                self.state.setText(
-                    reply.get("state", "Ready")
-                    if isinstance(reply, dict)
-                    else "Connected"
-                )
                 if isinstance(reply, Client):
                     self.connected = True
-                if isinstance(reply, dict):
-                    self.state.setText(
-                        f"{reply.get('state', '')} · {reply.get('message', '')}"
-                    )
+                    self.state.setText("Connected")
+                elif isinstance(reply, StatusSnapshot):
+                    self.state.setText(f"{reply.state} · {reply.message}")
             except Exception as exc:
                 self.state.setText(str(exc))
             self.pending = None

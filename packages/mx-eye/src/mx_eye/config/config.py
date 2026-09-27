@@ -7,6 +7,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, Self
 
+from mx_eye_protocol.control import SourceMode, Transport
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -17,12 +18,6 @@ from pydantic import (
 
 class ConfigFormat(StrEnum):
     MX_EYE = "mx-eye"
-
-
-class SourceMode(StrEnum):
-    CAMERA = auto()
-    VIDEO = auto()
-    SIMULATION = auto()
 
 
 class CameraBackend(StrEnum):
@@ -40,11 +35,6 @@ class TrackingMode(StrEnum):
 class PupilCoordinates(StrEnum):
     ABSOLUTE = auto()
     RELATIVE = auto()
-
-
-class Transport(StrEnum):
-    TCP = auto()
-    UDP = auto()
 
 
 class RecordingCodec(StrEnum):
@@ -110,15 +100,14 @@ class NetworkConfig(ConfigModel):
     bind: IPv4Address = IPv4Address("127.0.0.1")
     data_port: int = Field(default=5556, ge=1024, le=65535)
     control_port: int = Field(default=5557, ge=1024, le=65535)
-    sync_port: int = Field(default=5558, ge=1024, le=65535)
     transport: Transport = Transport.TCP
     udp_host: IPv4Address = IPv4Address("127.0.0.1")
 
     @model_validator(mode="after")
     def validate_distinct_ports(self) -> "NetworkConfig":
-        ports = {self.data_port, self.control_port, self.sync_port}
-        if len(ports) != 3:
-            raise ValueError("Use three distinct ports between 1024 and 65535.")
+        ports = {self.data_port, self.control_port}
+        if len(ports) != 2:
+            raise ValueError("Use two distinct ports between 1024 and 65535.")
         return self
 
 

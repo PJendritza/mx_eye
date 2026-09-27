@@ -1,4 +1,4 @@
-"""Session lifecycle and separate command/clock servers."""
+"""Session lifecycle and a single command/clock request-response server."""
 
 import base64
 import concurrent.futures
@@ -14,17 +14,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 from mx_eye_protocol.control import (
-    CMD_START,
-    CMD_STATUS,
-    CMD_STOP,
-    CMD_SYNC,
-    PROTOCOL_VERSION,
+    ClockSync,
+    Command,
+    NetworkStatus,
     Reply,
     Request,
+    SourceStatus,
     StatusSnapshot,
+    TrackingStats,
 )
 
 from .config import MxEyeConfigStore, SourceMode
+from .control_server import ControlServer
 from .pipeline import (
     FrameRing,
     Mailbox,
@@ -33,7 +34,6 @@ from .pipeline import (
     tracking_worker,
     writer_worker,
 )
-from .transport import listen, receive_json, send_json
 
 STAT_NAMES = (
     "acquired",
@@ -72,28 +72,40 @@ class Service:
         self.source_info = {}
         self.priority_info = []
         self._server_errors = []
-        self._threads = []
+        self._server = None
+        self._server_thread = None
         self._owner = threading.Thread(
             target=self._supervise, daemon=True, name="mx-eye supervisor"
         )
         self._owner.start()
-        self._start_servers()
+        self._start_server()
 
-    def _start_servers(self):
-        self._servers_stop = threading.Event()
-        for kind in ("control", "sync"):
-            ready = threading.Event()
-            t = threading.Thread(
-                target=self._serve,
-                args=(kind, ready),
-                daemon=True,
-                name=f"mx-eye {kind}",
+    def _start_server(self):
+        net = self.config.value.network
+        try:
+            self._server = ControlServer(
+                (str(net.bind), net.control_port), self._dispatch_request
             )
-            t.start()
-            self._threads.append(t)
-            ready.wait(3)
-        if self._server_errors:
+        except OSError as exc:
+            self._server_errors.append(f"control server: {exc}")
             self.message = "; ".join(self._server_errors)
+            return
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+            name="mx-eye control",
+        )
+        self._server_thread.start()
+
+    def _stop_server(self):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._server_thread is not None:
+            self._server_thread.join(1)
+            self._server_thread = None
 
     def submit(self, command, **args):
         future = concurrent.futures.Future()
@@ -113,10 +125,12 @@ class Service:
                 message=self.message,
                 paused=bool(run and run["paused"].is_set()),
                 session=self.session,
-                stats=stats,
+                stats=TrackingStats.model_validate(stats),
                 directory=self.directory,
-                network=self.config.value.network.model_dump(mode="json"),
-                source=dict(self.source_info),
+                network=NetworkStatus.model_validate(
+                    self.config.value.network, from_attributes=True
+                ),
+                source=SourceStatus.model_validate(self.source_info),
                 priority=list(self.priority_info),
                 server_errors=list(self._server_errors),
             )
@@ -163,48 +177,14 @@ class Service:
                             item["result"]["template_center"]
                         )
 
-    def _serve(self, kind, ready):
-        net = self.config.value.network
-        server = None
-        try:
-            port = net.sync_port if kind == "sync" else net.control_port
-            server = listen(net.bind, port)
-            server.settimeout(0.1)
-            ready.set()
-            while not self._servers_stop.is_set():
-                try:
-                    sock, _ = server.accept()
-                except TimeoutError:
-                    continue
-                with sock:
-                    sock.settimeout(3)
-                    try:
-                        req = Request.from_dict(receive_json(sock))
-                        t2 = time.perf_counter_ns()
-                        if req.protocol != PROTOCOL_VERSION:
-                            raise ValueError("Unsupported protocol version")
-                        if kind == "sync" and req.command == CMD_SYNC:
-                            reply = Reply(t1=req.t1, t2=t2, t3=time.perf_counter_ns())
-                        elif kind == "control" and req.command == CMD_STATUS:
-                            reply = Reply(status=self.snapshot())
-                        elif kind == "control" and req.command in (CMD_START, CMD_STOP):
-                            reply = Reply(
-                                status=self.submit(req.command).result(timeout=15)
-                            )
-                        else:
-                            raise ValueError("Unsupported command on this port")
-                    except Exception as exc:
-                        reply = Reply(ok=False, error=str(exc))
-                    try:
-                        send_json(sock, reply.to_dict())
-                    except OSError:
-                        pass
-        except OSError as exc:
-            self._server_errors.append(f"{kind} server: {exc}")
-            ready.set()
-        finally:
-            if server is not None:
-                server.close()
+    def _dispatch_request(self, request: Request, received_ns: int) -> Reply:
+        if request.command is Command.SYNC:
+            return Reply(
+                sync=ClockSync(t1=request.t1, t2=received_ns, t3=time.perf_counter_ns())
+            )
+        if request.command is Command.STATUS:
+            return Reply(status=self.snapshot())
+        return Reply(status=self.submit(request.command).result(timeout=15))
 
     def _start(self):
         if self.run:
@@ -480,9 +460,9 @@ class Service:
             self.run = None
 
     def _execute(self, command, args):
-        if command == CMD_START:
+        if command == Command.START:
             return self._start()
-        if command == CMD_STOP:
+        if command == Command.STOP:
             return self._stop()
         if command == "settings":
             if self.run:
@@ -493,12 +473,9 @@ class Service:
             network_changed = updated.value.network != self.config.value.network
             self.config.replace(updated.value)
             if network_changed:
-                self._servers_stop.set()
-                for t in self._threads:
-                    t.join(1)
-                self._threads.clear()
+                self._stop_server()
                 self._server_errors.clear()
-                self._start_servers()
+                self._start_server()
                 if self._server_errors:
                     raise RuntimeError("; ".join(self._server_errors))
             return self.snapshot()
@@ -561,8 +538,6 @@ class Service:
         deadline = time.monotonic() + 33
         while self.run and time.monotonic() < deadline:
             time.sleep(0.02)
-        self._servers_stop.set()
-        for t in self._threads:
-            t.join(1)
+        self._stop_server()
         self._quit.set()
         self._owner.join(1)

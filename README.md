@@ -1,7 +1,7 @@
 # mx_eye
 
 First integrated MXBI pupil / corneal-reflection tracker, with a separate receiver SDK and client.
-Python 3.10+; desktop UI for Windows/Linux.
+Python 3.11+; desktop UI for Windows/Linux.
 
 The repository is a uv workspace with four packages: `mx-eye` (the tracker),
 `mx-eye-client` (the remote client), `py-mx-eye` (the Python SDK) and
@@ -80,3 +80,28 @@ before buffering their declared bodies.
 This replaces the former 104-byte v1 sample protocol: update tracker and SDK
 together. UDP samples use the same new envelope. Recording CSV columns and
 precision are unchanged. The binary CMD type remains reserved.
+
+All four commands (`start`, `stop`, `status`, `sync`) use the single TCP
+`control_port` (default 5557). Each connection sends one newline-delimited JSON
+request, receives one JSON response, and closes. The server handles connections
+concurrently so a slow start does not block clock synchronization.
+Control messages do not use the binary DataFrame envelope.
+
+`control.py` defines Pydantic models and `Command`, `Transport`, and `SourceMode`
+string enums using `auto()`. JSON retains lowercase string values. Successful replies
+contain `ok: true` and either a nested `status` or `sync` result; failures contain
+`ok: false` and an `error` string. For example, a request is
+`{"command":"status","protocol":"1.0.0"}` followed by a newline.
+The control protocol version uses SemVer; only `1.0.0` is currently supported.
+Legacy integer protocol versions and other version strings are rejected.
+The SDK's `start()`, `stop()` and `status()` return `StatusSnapshot` models:
+
+```python
+status = eye.status()
+print(status.state, status.stats.tracked, status.network.control_port)
+```
+
+Update tracker and SDK together for the new response shape. Remove `sync_port`
+from existing configuration files and client calls; `--sync-port` has also been
+removed. Pydantic is now a dependency of the shared protocol package. The SDK
+still does not load Qt, OpenCV or the tracker.

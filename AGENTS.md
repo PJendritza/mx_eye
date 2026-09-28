@@ -159,14 +159,45 @@ the camera or USB driver. `tracking_log_complete` separately reports log overflo
 
 ## SDK details
 
-`latest()` can return None before the tracker produces its first valid sample. It
-also rejects invalid/lost or stale samples; never use the previous
-valid point as if it were a current measurement. `latest(max_age_ms=None,
-require_valid=False)` is intended for diagnostics. `drain()` returns buffered
-samples for plotting/logging and clears that buffer. A background thread receives
-regardless of how often your code calls either method. Its bounded buffer reports
-overwrites rather than blocking. Use `status()` to inspect tracker/recording state.
-Closing a client alone does **not** stop the tracker; `stop()` is explicit.
+The public handle is `MxEye`; `MxEye`, `MxEyeConfig` and `Sample` are exported
+from `py_mx_eye`. The constructor takes one parameter object, the frozen
+`MxEyeConfig` dataclass (host, both ports, transport, UDP bind address and
+timeout), and `SampleReceiver` takes `ReceiverConfig` the same way: a constructor
+never carries a long parameter list.
+
+The SDK is **fully synchronous and owns no thread**: every call runs on the
+caller's thread, so a consumer that has a thread of its own keeps control of it
+and never ends up with threads nested inside the SDK. `read(timeout, max_age_ms,
+require_valid)` is the only data access, and it is an iterator:
+`for sample in eye.read():` waits on the caller's thread for each sample.
+`with MxEye(...)` scopes the sample stream: `connect()` on entry, `close()` on
+exit, so a `with` block always releases the socket even when its body raises.
+`start()`/`stop()`/`status()` drive the control port and never touch the sample
+stream, so acquisition is only ever started explicitly, and neither a `with` exit
+nor `close()` stops the tracker.
+
+`read()` yields one `Sample` per step and keeps the measurement guarantee:
+samples that are lost, stale, or whose timestamp disagrees with the receiver
+clock are skipped while it waits, so a yielded sample is always a current
+measurement. `timeout` bounds each wait rather than the whole loop and the loop
+ends when a wait expires: `read(0)` drains what has arrived without blocking
+(what the Qt client does at 25 Hz), a finite timeout also ends the loop after
+that much silence, and the default waits indefinitely. Never use the previous
+valid point as if it were a current measurement. `max_age_ms=None` skips the age
+check and `require_valid=False` skips the validity check; together they yield
+whatever arrives next, which is what plotting and diagnostics want. Nothing is buffered beyond the
+frame currently arriving and the samples already parsed from the last received
+chunk, so there is no overwrite counter and no buffered backlog to fall behind.
+Errors are exceptions, not silent state: `connect()` raises when the tracker is
+not publishing, a closed or broken stream raises `ConnectionError` (the socket is
+released; connect again to resume), and a malformed TCP header raises
+`FrameError`/`ValueError`. Samples that repeat a sequence, arrive out of order, or
+belong to a session already left behind are dropped; a new session restarts
+sequence numbers and is followed rather than stalled on. Use `status()` to
+inspect tracker/recording state. `MxEyeConfig.transport` is an explicit
+`Transport` member (default TCP) that nothing infers, so it must match the
+tracker's own setting; the handle keeps the config it was given, and `timeout`
+bounds the socket connect and the control requests.
 
 Coordinates are **uncalibrated source-image pixels**, positive x rightward and y
 downward. They are not screen coordinates or visual degrees. Invalid signals use
@@ -176,7 +207,7 @@ No gaze calibration or neural eye-region detector is included in this first vers
 
 The SDK is the `py-mx-eye` workspace member; it is not published to PyPI yet, so use it
 from a checkout (`uv sync --all-extras`) or install the wheels built by `uv build` for
-`py-mx-eye` and `mx-eye-protocol`. It uses `mx-eye-protocol` and its Pydantic JSON models, and never loads Qt or OpenCV.
+`py-mx-eye` and `mx-eye-protocol`. It uses `mx-eye-protocol` and its Pydantic models, and never loads Qt or OpenCV.
 
 ## Networking
 
@@ -188,20 +219,27 @@ Defaults are local-machine only:
 | Start/stop/status commands | TCP | 5557 |
 
 For separate computers: set tracker bind address to `0.0.0.0`, use its LAN IP in
-`Client(...)` or `uv run mx-eye-receiver --host TRACKER_IP`, and allow the
+`MxEyeConfig(host=...)` or `uv run mx-eye-receiver --host TRACKER_IP`, and allow the
 configured ports through the local firewall. With UDP, also set the receiver's
 LAN IP in tracker Settings. UDP has one target; TCP accepts up to eight receivers.
-The SDK reads the configured transport from the status server when connecting.
+The SDK does not read the transport from the status server: `MxEyeConfig`
+states it (default TCP) and it must match the tracker's setting. `connect()`
+opens the data socket and raises while the tracker is not publishing; because
+the tracking process creates its `Publisher` per session, the data port exists
+only between Start and Stop, so connect after starting a session. Nothing is
+retried: the caller decides whether to connect again.
 Both address fields are validated as IPv4 literals, so hostnames are rejected
 instead of being resolved at run time.
 Reconnect clients after changing transport/ports. The protocol is unauthenticated
 and intended for a trusted lab network, not an exposed internet service.
 
 Sample TCP uses length-prefixed binary framing, disables Nagle, and never waits for slow
-receivers: a partial/blocked send disconnects that receiver, which reconnects.
+receivers: a partial/blocked send disconnects that receiver, which the SDK reports
+as `ConnectionError` so the caller can connect again.
 UDP can lose/reorder datagrams. Both include a session ID, sample sequence, and
-source-frame ID. The SDK rejects out-of-order samples, resets on a new session,
-and reports sequence gaps. Neither mode guarantees delivery of every sample.
+source-frame ID. The SDK drops out-of-order samples and anything from a session
+it already left behind, and follows a new session from its first sample. Neither
+mode guarantees delivery of every sample.
 
 The sample frame header is little-endian `<4sBI`: magic `MXEY`, message type
 (`DATA=1`, `CMD=2`), and uint32 encoded payload length (excluding the header).
@@ -223,12 +261,22 @@ SDK start/stop/status return StatusSnapshot with field access such as
 Remove legacy `sync_port` configuration/client arguments and `--sync-port`;
 old flat status responses are no longer supported. Update both endpoints together.
 
-`packages/protocol/src/mx_eye_protocol/data_frame.py` defines TrackingPayload,
-DataFrame and flags. DataFrame contains magic, message_type, length and payload;
-DataFrame owns the shared binary layout and exposes `from_payload()`, `encode()`
-and the `frame_size` property. Encoding does not validate the header.
-`DataFrame.header_size` is the stream header length. The SDK implements decoding
-and incoming-header validation in `py_mx_eye/_decoder.py`.
+`packages/protocol/src/mx_eye_protocol/data_frame.py` declares the payload's
+wire order exactly once, as `_TRACKING_LAYOUT` (field name plus struct code);
+`TRACKING_FIELDS` and `DataFrame.TRACKING` both derive from it, so the struct,
+its encoded size and the decode field list cannot disagree, and `encode()` packs
+that same list instead of repeating it. `TrackingPayload` is a frozen Pydantic
+model whose field order is the wire order and whose declared types decode a
+payload, so the flags byte becomes a `TrackingFlags` member with no conversion
+code in the codec; a decoder validates once with
+`model_validate(dict(zip(TRACKING_FIELDS, unpack(...), strict=True)))`.
+`DataFrame` stays a plain frozen dataclass envelope containing magic,
+message_type, length and payload, and owning the shared binary layout; it exposes
+`from_payload()`, `encode()` and the `frame_size` property. Encoding does not
+validate the header. `DataFrame.header_size` is the stream header length. The SDK
+implements decoding and incoming-header validation in `py_mx_eye/receiver.py`,
+where the caller's thread reads the header, then exactly the payload bytes the
+header declares.
 The SDK Sample contains the complete frame plus its reception time.
 Use `sample.frame.payload` to access tracking fields.
 Recording queues carry TrackingPayload objects; the recording layer maps them to
@@ -239,7 +287,7 @@ TrackingPayload flags use TrackingFlags (IntFlag); combine members with `|`.
 sampling attributes have been removed. Use `sample.frame.length` for encoded
 payload size and `sample.age_ms` for reception timing.
 TCP reception handles split and coalesced frames, rejecting unknown message
-types, reserved CMD frames and invalid DATA lengths before buffering their bodies.
+types, reserved CMD frames and invalid DATA lengths before their bodies are read.
 UDP uses the same binary envelope. Control JSON does not use that envelope.
 Enum values remain lowercase strings in JSON. Successful replies contain
 `ok: true` and a `status`; failures contain `ok: false` and `error`.
@@ -251,8 +299,8 @@ followed by a newline.
 `mx-eye-protocol` ships inline type annotations and a PEP 561 `py.typed` marker
 in both wheels and source distributions. After installing workspace development
 dependencies, run `uv run pyright` from the repository root. Strict checking covers
-`packages/protocol/src/mx_eye_protocol` and targets Python 3.11; other workspace
-packages are outside this check. Use
+`packages/protocol/src/mx_eye_protocol` and `packages/py-mx-eye/src/py_mx_eye`,
+and targets Python 3.11; other workspace packages are outside this check. Use
 `uv run pyright --verifytypes mx_eye_protocol --ignoreexternal` to check public
 API type completeness without evaluating external dependencies.
 
@@ -312,7 +360,7 @@ ends are in **one clock domain**: the same machine, or separate machines
 synchronized as described above. The tracker does not maintain a sync port, RTT
 probes, offset estimation or resynchronization logic; that is infrastructure,
 not part of `mx_eye`. On separate hosts without NTP/PTP the readouts are
-meaningless, and `latest(max_age_ms=...)` will reject samples whose age cannot be
+meaningless, and `read(max_age_ms=...)` will reject samples whose age cannot be
 certified.
 
 CLOCK_REALTIME can step by a leap second, which may make a single sample look
@@ -321,7 +369,7 @@ deadlines and GUI refresh keep using `time.monotonic()`, because they measure
 elapsed time inside one process rather than a shared time base.
 
 A timestamp ahead of the receiver clock means the ends are not reading the same
-clock, so such a sample is not certified fresh; `latest(max_age_ms=None,
+clock, so such a sample is not certified fresh; `read(max_age_ms=None,
 require_valid=False)` still exposes its age for diagnostics. Negative estimates
 are never silently clamped away.
 

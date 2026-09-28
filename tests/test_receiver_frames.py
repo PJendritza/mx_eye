@@ -1,38 +1,29 @@
-"""Exercise stream framing, session filtering and datagram rejection.
+"""Synchronous data plane: framing, filtering, timeouts and stream failure.
 
-The receive loop is driven directly through SampleReceiver with injected socket
-sources; the end-to-end test uses a real Publisher, ControlServer and Client.
+SampleReceiver is driven directly over real sockets: a socketpair for TCP and a
+bound datagram socket for UDP. The public MxEye path is covered in
+test_sdk_read.py, and byte-at-a-time framing in test_framing.py.
 """
 
 import socket
 import struct
-import threading
 import time
-from collections import deque
-from collections.abc import Callable, Iterable
-from dataclasses import replace
 
 import pytest
-from mx_eye.control_server import ControlServer
-from mx_eye.transport import Publisher
 from mx_eye_protocol import DataFrame, MessageType, TrackingFlags, TrackingPayload
-from mx_eye_protocol.control import (
-    NetworkStatus,
-    Reply,
-    StatusSnapshot,
-    Transport,
-)
-from py_mx_eye import Client
-from py_mx_eye.receiver import SampleReceiver
+from mx_eye_protocol.control import Transport
+from py_mx_eye.receiver import FrameError, ReceiverConfig, SampleReceiver
 
 HEADER = struct.Struct("<4sBI")
 
 
-def _payload(sequence: int) -> TrackingPayload:
+def _payload(
+    sequence: int, session: int = 1, source_frame: int | None = None
+) -> TrackingPayload:
     return TrackingPayload(
-        session=1,
+        session=session,
         sequence=sequence,
-        frame=sequence,
+        frame=sequence if source_frame is None else source_frame,
         acquisition_ns=1,
         tracking_start_ns=2,
         tracking_end_ns=3,
@@ -50,282 +41,8 @@ def _payload(sequence: int) -> TrackingPayload:
     )
 
 
-def _fresh_payload(sequence: int, flags: TrackingFlags = TrackingFlags.VALID):
-    """A payload stamped now, as a live tracker would send it."""
-    stamp = time.time_ns()
-    return replace(_payload(sequence), acquisition_ns=stamp, send_ns=stamp, flags=flags)
-
-
-class ScriptedSocket:
-    """Supply exact recv boundaries and end the loop when its chunks run out."""
-
-    def __init__(
-        self, chunks: Iterable[bytes], on_exhausted: Callable[[], None]
-    ) -> None:
-        self.chunks = deque(chunks)
-        self.on_exhausted = on_exhausted
-        self.closed = False
-        self.reads = 0
-
-    def settimeout(self, timeout: float) -> None:
-        pass
-
-    def recv(self, size: int) -> bytes:
-        self.reads += 1
-        if self.chunks:
-            return self.chunks.popleft()
-        self.on_exhausted()
-        raise TimeoutError
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def _scripted_receiver(
-    chunk_groups: Iterable[Iterable[bytes]], max_samples: int = 4096
-) -> tuple[SampleReceiver, list[ScriptedSocket]]:
-    """Run one synchronous TCP receive loop over scripted chunk boundaries."""
-    holder: dict[str, SampleReceiver] = {}
-    connections = deque(
-        ScriptedSocket(chunks, lambda: holder["receiver"].stop())
-        for chunks in chunk_groups
-    )
-    sockets: list[ScriptedSocket] = []
-
-    def connect(address: tuple[str, int], timeout: float) -> ScriptedSocket:
-        assert connections, "the receiver reconnected more often than scripted"
-        sock = connections.popleft()
-        sockets.append(sock)
-        return sock
-
-    receiver = SampleReceiver(
-        host="127.0.0.1",
-        port=5556,
-        udp_bind="0.0.0.0",
-        max_samples=max_samples,
-        connect=connect,
-    )
-    holder["receiver"] = receiver
-    receiver.run(Transport.TCP)
-    return receiver, sockets
-
-
-@pytest.mark.parametrize(
-    "chunks",
-    [
-        [
-            DataFrame.from_payload(_payload(1)).encode(),
-            DataFrame.from_payload(_payload(2)).encode(),
-        ],
-        [
-            DataFrame.from_payload(_payload(1)).encode()
-            + DataFrame.from_payload(_payload(2)).encode()
-        ],
-        [
-            DataFrame.from_payload(_payload(1)).encode()[:3],
-            DataFrame.from_payload(_payload(1)).encode()[3:8],
-            DataFrame.from_payload(_payload(1)).encode()[8:20],
-            DataFrame.from_payload(_payload(1)).encode()[20:]
-            + DataFrame.from_payload(_payload(2)).encode()[:5],
-            DataFrame.from_payload(_payload(2)).encode()[5:],
-        ],
-        [
-            bytes([byte])
-            for byte in DataFrame.from_payload(_payload(1)).encode()
-            + DataFrame.from_payload(_payload(2)).encode()
-        ],
-    ],
-)
-def test_tcp_chunk_boundaries(chunks):
-    receiver, _ = _scripted_receiver([chunks])
-    samples = receiver.drain()
-    assert [sample.frame.payload.sequence for sample in samples] == [1, 2]
-    assert samples[0].frame.magic == b"MXEY"
-    assert samples[0].frame.message_type is MessageType.DATA
-    assert samples[0].frame.length == 97
-    assert receiver.latest() is samples[-1]
-    assert receiver.drain() == []
-    assert receiver.counters().malformed == 0
-    assert receiver.error == ""
-
-
-@pytest.mark.parametrize(
-    "bad_header",
-    [
-        HEADER.pack(b"FAIL", MessageType.DATA, 97),
-        HEADER.pack(b"MXEY", 255, 97),
-        HEADER.pack(b"MXEY", MessageType.CMD, 97),
-        HEADER.pack(b"MXEY", MessageType.DATA, 0),
-        HEADER.pack(b"MXEY", MessageType.DATA, 0xFFFFFFFF),
-    ],
-)
-def test_bad_tcp_header_reconnects_without_reading_body(bad_header):
-    receiver, sockets = _scripted_receiver(
-        [
-            [bad_header, b"body must not be read"],
-            [DataFrame.from_payload(_payload(1)).encode()],
-        ]
-    )
-    assert sockets[0].reads == 1
-    assert sockets[0].closed
-    assert receiver.counters().malformed == 1
-    assert receiver.counters().received == 1
-    assert receiver.drain()[0].frame.payload == _payload(1)
-
-
-def test_disconnect_discards_partial_frame():
-    receiver, _ = _scripted_receiver(
-        [
-            [DataFrame.from_payload(_payload(1)).encode()[:30], b""],
-            [DataFrame.from_payload(_payload(2)).encode()],
-        ]
-    )
-    assert [sample.frame.payload.sequence for sample in receiver.drain()] == [2]
-    assert receiver.counters().received == 1
-
-
-def test_a_frame_before_a_bad_header_is_still_delivered():
-    """One read may hold a good frame and then lose the stream boundary."""
-    receiver, sockets = _scripted_receiver(
-        [
-            [
-                DataFrame.from_payload(_payload(1)).encode()
-                + HEADER.pack(b"FAIL", MessageType.DATA, 97)
-            ],
-            [DataFrame.from_payload(_payload(2)).encode()],
-        ]
-    )
-    assert sockets[0].reads == 1
-    assert [sample.frame.payload.sequence for sample in receiver.drain()] == [1, 2]
-    assert receiver.counters().received == 2
-    assert receiver.counters().malformed == 1
-    assert receiver.error == ""
-
-
-def test_sequence_filter_after_frame_decode():
-    chunk = b"".join(
-        DataFrame.from_payload(_payload(sequence)).encode()
-        for sequence in [1, 3, 2, 3, 4]
-    )
-    receiver, _ = _scripted_receiver([[chunk]])
-    assert [sample.frame.payload.sequence for sample in receiver.drain()] == [1, 3, 4]
-    assert receiver.counters().out_of_order == 2
-    assert receiver.counters().sequence_gaps == 1
-
-
-def test_acquisition_skips_count_frames_the_tracker_never_processed():
-    chunk = b"".join(
-        DataFrame.from_payload(replace(_payload(sequence), frame=frame)).encode()
-        for sequence, frame in [(1, 1), (2, 5), (5, 9)]
-    )
-    receiver, _ = _scripted_receiver([[chunk]])
-    assert [sample.frame.payload.sequence for sample in receiver.drain()] == [1, 2, 5]
-    assert receiver.counters().sequence_gaps == 2
-    assert receiver.counters().acquisition_skips == 4
-
-
-def test_buffer_overwrites_count_dropped_samples():
-    chunk = b"".join(
-        DataFrame.from_payload(_payload(sequence)).encode() for sequence in [1, 2, 3, 4]
-    )
-    receiver, _ = _scripted_receiver([[chunk]], max_samples=2)
-    assert [sample.frame.payload.sequence for sample in receiver.drain()] == [3, 4]
-    assert receiver.counters().buffer_overwrites == 2
-    assert receiver.counters().received == 4
-
-
-def test_new_session_resets_the_sequence_filter():
-    chunk = b"".join(
-        DataFrame.from_payload(replace(_payload(sequence), session=session)).encode()
-        for session, sequence in [(1, 1), (1, 2), (2, 1), (1, 3)]
-    )
-    receiver, _ = _scripted_receiver([[chunk]])
-    # The session change resets sequence tracking and drops the old buffer.
-    assert [
-        (sample.frame.payload.session, sample.frame.payload.sequence)
-        for sample in receiver.drain()
-    ] == [(2, 1)]
-    assert receiver.counters().received == 3
-    assert receiver.counters().out_of_order == 0
-
-
-def test_tcp_socketpair():
-    receiver_end, sender = socket.socketpair()
-    receiver = SampleReceiver(
-        host="127.0.0.1",
-        port=5556,
-        udp_bind="0.0.0.0",
-        max_samples=4096,
-        connect=lambda address, timeout: receiver_end,
-    )
-    thread = threading.Thread(target=receiver.run, args=(Transport.TCP,))
-    thread.start()
-    try:
-        assert receiver.wait_ready(2)
-        sender.sendall(
-            DataFrame.from_payload(_payload(1)).encode()
-            + DataFrame.from_payload(_payload(2)).encode()
-        )
-        deadline = time.monotonic() + 2
-        while receiver.counters().received < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert receiver.counters().received == 2
-        assert [sample.frame.payload for sample in receiver.drain()] == [
-            _payload(1),
-            _payload(2),
-        ]
-    finally:
-        receiver.stop()
-        thread.join(timeout=2)
-        sender.close()
-    assert not thread.is_alive()
-    assert receiver.error == ""
-
-
-def test_udp_drops_bad_datagrams():
-    holder: dict[str, SampleReceiver] = {}
-    datagrams = deque(
-        [
-            b"broken",
-            HEADER.pack(b"MXEY", MessageType.CMD, 0),
-            DataFrame.from_payload(_payload(1)).encode()[:-1],
-            DataFrame.from_payload(_payload(1)).encode() + b"extra",
-            DataFrame.from_payload(_payload(1)).encode(),
-        ]
-    )
-
-    class DatagramSocket:
-        def setsockopt(self, *args):
-            pass
-
-        def bind(self, address):
-            pass
-
-        def settimeout(self, timeout):
-            pass
-
-        def recvfrom(self, size):
-            if datagrams:
-                return datagrams.popleft(), ("127.0.0.1", 5556)
-            holder["receiver"].stop()
-            raise TimeoutError
-
-        def close(self):
-            pass
-
-    receiver = SampleReceiver(
-        host="127.0.0.1",
-        port=5556,
-        udp_bind="0.0.0.0",
-        max_samples=4096,
-        datagram=lambda *args: DatagramSocket(),
-    )
-    holder["receiver"] = receiver
-    receiver.run(Transport.UDP)
-    assert receiver.error == ""
-    assert receiver.counters().malformed == 4
-    assert receiver.counters().received == 1
-    assert receiver.drain()[0].frame.payload == _payload(1)
+def _frame(*payloads: TrackingPayload) -> bytes:
+    return b"".join(DataFrame.from_payload(payload).encode() for payload in payloads)
 
 
 def _free_port() -> int:
@@ -334,82 +51,152 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
+def _tcp_receiver() -> tuple[SampleReceiver, socket.socket]:
+    """A receiver reading one end of a connected socketpair."""
+    peer, sender = socket.socketpair()
+    receiver = SampleReceiver(
+        ReceiverConfig(
+            host="127.0.0.1",
+            port=5556,
+            connect=lambda address, timeout: peer,
+        )
+    )
+    receiver.open(Transport.TCP, 1.0)
+    return receiver, sender
 
 
-def _deliver(publisher: Publisher, client: Client, frame: bytes, target: int) -> bool:
-    """Publish until the receiver has counted ``target`` samples."""
+def _udp_receiver() -> tuple[SampleReceiver, socket.socket, int]:
+    """A receiver bound to a datagram port, plus a socket that can send to it."""
+    port = _free_port()
+    receiver = SampleReceiver(ReceiverConfig(host="127.0.0.1", port=port))
+    receiver.open(Transport.UDP, 1.0)
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return receiver, sender, port
 
-    def attempt() -> bool:
-        publisher.send(frame)
-        return client.stats.received >= target
 
-    return _wait_until(attempt)
+def _sequences(receiver: SampleReceiver, timeout: float = 0.05) -> list[int]:
+    """Read until nothing arrives within the timeout."""
+    seen: list[int] = []
+    while (sample := receiver.next_sample(timeout)) is not None:
+        seen.append(sample.frame.payload.sequence)
+    return seen
 
 
-def test_client_receives_published_frames():
-    """The public Client path: connect, receive, then apply the freshness rules."""
-    data_port, control_port = _free_port(), _free_port()
+def test_one_frame_per_call():
+    receiver, sender = _tcp_receiver()
+    try:
+        sender.sendall(_frame(_payload(1), _payload(2)))
+        first = receiver.next_sample(1.0)
+        second = receiver.next_sample(1.0)
+        assert first is not None and first.frame.payload.sequence == 1
+        assert second is not None and second.frame.payload.sequence == 2
+        assert first.receive_ns > 0
+    finally:
+        receiver.close()
+        sender.close()
 
-    def dispatch(request):
-        return Reply(
-            status=StatusSnapshot(
-                state="idle",
-                network=NetworkStatus(
-                    data_port=data_port,
-                    control_port=control_port,
-                    transport=Transport.TCP,
-                ),
+
+def test_zero_timeout_polls_and_times_out_without_blocking():
+    receiver, sender = _tcp_receiver()
+    try:
+        assert receiver.next_sample(0.0) is None
+        started = time.monotonic()
+        assert receiver.next_sample(0.05) is None
+        assert time.monotonic() - started >= 0.03
+        sender.sendall(_frame(_payload(1)))
+        assert receiver.next_sample(0.0).frame.payload.sequence == 1
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_a_partial_frame_waits_for_the_rest():
+    receiver, sender = _tcp_receiver()
+    data = _frame(_payload(1))
+    try:
+        sender.sendall(data[:40])
+        assert receiver.next_sample(0.05) is None
+        sender.sendall(data[40:])
+        sample = receiver.next_sample(1.0)
+        assert sample is not None and sample.frame.payload.sequence == 1
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_duplicates_and_old_sequences_are_dropped():
+    receiver, sender = _tcp_receiver()
+    try:
+        sender.sendall(_frame(*(_payload(s) for s in (1, 3, 2, 3, 4))))
+        assert _sequences(receiver) == [1, 3, 4]
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_a_new_session_restarts_the_sequence_filter():
+    receiver, sender = _tcp_receiver()
+    try:
+        sender.sendall(
+            _frame(
+                _payload(1),
+                _payload(2),
+                _payload(1, session=2),
+                _payload(3),
             )
         )
+        samples = []
+        while (sample := receiver.next_sample(0.05)) is not None:
+            payload = sample.frame.payload
+            samples.append((payload.session, payload.sequence))
+        # The first session's later sequence is left behind, not replayed.
+        assert samples == [(1, 1), (1, 2), (2, 1)]
+    finally:
+        receiver.close()
+        sender.close()
 
-    with ControlServer(("127.0.0.1", control_port), dispatch) as server:
-        server_thread = threading.Thread(
-            target=server.serve_forever, kwargs={"poll_interval": 0.01}
-        )
-        server_thread.start()
-        publisher = Publisher("127.0.0.1", data_port)
-        client = Client("127.0.0.1", data_port, control_port)
-        try:
-            assert client.connect() is client
 
-            fresh = DataFrame.from_payload(_fresh_payload(1)).encode()
-            assert _deliver(publisher, client, fresh, 1)
-            sample = client.latest(max_age_ms=50)
-            assert sample is not None
-            assert sample.frame.payload.x == 1.0
+def test_a_good_frame_before_a_bad_header_is_delivered():
+    """One read may hold a good frame and then lose the stream boundary."""
+    receiver, sender = _tcp_receiver()
+    try:
+        sender.sendall(_frame(_payload(1)) + HEADER.pack(b"FAIL", MessageType.DATA, 97))
+        sample = receiver.next_sample(1.0)
+        assert sample is not None and sample.frame.payload.sequence == 1
+        with pytest.raises(FrameError):
+            receiver.next_sample(1.0)
+        # The stream is gone; the caller has to connect again.
+        with pytest.raises(RuntimeError, match="connect again"):
+            receiver.next_sample(1.0)
+    finally:
+        receiver.close()
+        sender.close()
 
-            stale = DataFrame.from_payload(
-                replace(
-                    _fresh_payload(2),
-                    acquisition_ns=time.time_ns() - 5_000_000_000,
-                )
-            ).encode()
-            assert _deliver(publisher, client, stale, 2)
-            assert client.latest(max_age_ms=50) is None
-            assert client.latest(max_age_ms=None, require_valid=False) is not None
 
-            lost = DataFrame.from_payload(
-                _fresh_payload(3, flags=TrackingFlags.NONE)
-            ).encode()
-            assert _deliver(publisher, client, lost, 3)
-            assert client.latest(max_age_ms=None) is None
-            assert client.latest(max_age_ms=None, require_valid=False) is not None
+def test_a_closed_peer_is_a_connection_error():
+    receiver, sender = _tcp_receiver()
+    try:
+        sender.close()
+        with pytest.raises(ConnectionError, match="closed the sample stream"):
+            receiver.next_sample(1.0)
+    finally:
+        receiver.close()
 
-            assert [s.frame.payload.sequence for s in client.drain()] == [1, 2, 3]
-            assert client.drain() == []
-            assert client.stats.received == 3
-            assert client.stats.error == ""
-            assert client.transport is Transport.TCP
-        finally:
-            client.close()
-            publisher.close()
-            server.shutdown()
-            server_thread.join(timeout=2)
-    assert not server_thread.is_alive()
+
+def test_udp_drops_bad_datagrams_without_losing_the_stream():
+    receiver, sender, port = _udp_receiver()
+    good = _frame(_payload(1))
+    try:
+        for data in (
+            b"broken",
+            HEADER.pack(b"MXEY", MessageType.CMD, 0),
+            good[:-1],
+            good + b"extra",
+        ):
+            sender.sendto(data, ("127.0.0.1", port))
+        sender.sendto(good, ("127.0.0.1", port))
+        sample = receiver.next_sample(1.0)
+        assert sample is not None and sample.frame.payload == _payload(1)
+    finally:
+        receiver.close()
+        sender.close()

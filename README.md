@@ -30,10 +30,11 @@ For a camera-free first check:
 uv run mx-eye --demo
 ```
 
-Click **Start** in the tracker. In the client, click **Connect**; its
-**Start tracker** and **Stop tracker** buttons control the same session.
-START is idempotent when a session is already running. Alternatively, connect the
-client first and start the session from there.
+Click **Start** in the tracker, then **Connect** in the client: the SDK's
+data port exists only while a session is publishing, so connecting first reports
+a refused connection. The client's **Start tracker** and **Stop tracker**
+buttons control the same session over the control port; START is idempotent when
+a session is already running.
 
 ## Clock synchronization
 
@@ -51,21 +52,35 @@ More detail in AGENTS.md.
 
 ## SDK
 
-The SDK is the `py-mx-eye` package; `uv sync --all-extras` installs it.
+The SDK is the `py-mx-eye` package; `uv sync --all-extras` installs it. It owns
+no thread: every call runs on the caller's thread, so a consumer that has a
+thread of its own stays in control of it.
 
 ```python
-from py_mx_eye import Client
+from py_mx_eye import MxEye, MxEyeConfig
 
-with Client("127.0.0.1") as eye:
-    eye.start()
-    # Inside your behavioral-task loop:
-    sample = eye.latest(max_age_ms=50)
-    if sample is not None:
+# The with block opens the sample stream and always releases it again.
+with MxEye(MxEyeConfig(host="127.0.0.1")) as eye:
+    for sample in eye.read():  # wait on this thread for each sample
         x, y = sample.frame.payload.x, sample.frame.payload.y
-    # At the end of the session:
-    eye.stop()
 ```
 
-`latest()` returns None until the tracker produces its first valid sample, and
-coordinates are uncalibrated source-image pixels. A runnable example:
+`MxEyeConfig` is a frozen dataclass holding the connection parameters, so the
+constructor itself stays one argument long. `with` scopes only the sample
+stream, which `connect()` opens (the data port exists only while a session runs)
+and `close()` releases; acquisition stays explicit through `start()`/`stop()`,
+so leaving the block never stops the tracker.
+
+`read()` yields only samples that are still current measurements: lost, stale
+and validity-failing samples are skipped while it waits. `timeout` bounds each
+wait rather than the whole loop, and the loop ends when a wait expires, so
+`read(0)` is a non-blocking drain (what a GUI timer wants), a finite timeout also
+ends the loop after that much silence, and the default waits indefinitely. Pass
+`max_age_ms=None, require_valid=False` to yield whatever arrives next, for
+plotting or diagnostics.
+
+Errors are exceptions rather than silent state: `connect()` raises when the
+tracker is not publishing, a closed or broken stream raises `ConnectionError`
+(connect again to resume), and a malformed frame raises `ValueError`. Coordinates
+are uncalibrated source-image pixels. A runnable example:
 `uv run python -m mx_eye_client.receive_minimal`. More detail in AGENTS.md.

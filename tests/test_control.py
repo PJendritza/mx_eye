@@ -21,7 +21,7 @@ from mx_eye_protocol.control import (
     Transport,
 )
 from mx_eye_protocol.json_io import receive_json
-from py_mx_eye import Client
+from py_mx_eye import MxEye, MxEyeConfig
 from py_mx_eye.control import ControlClient
 from pydantic import ValidationError
 
@@ -67,8 +67,8 @@ def test_config_and_sdk_share_protocol_enums():
     assert cfg.Transport is Transport
     assert cfg.SourceMode is SourceMode
     assert cfg.NetworkConfig().transport is Transport.TCP
-    assert Client(transport="udp").transport is Transport.UDP
-    assert Client(transport=Transport.TCP).transport is Transport.TCP
+    assert MxEyeConfig().transport is Transport.TCP
+    assert MxEyeConfig(transport=Transport.UDP).transport is Transport.UDP
     assert (
         '"transport":"udp"' in NetworkStatus(transport=Transport.UDP).model_dump_json()
     )
@@ -127,8 +127,22 @@ def test_invalid_responses(data):
         Reply.model_validate_json(data)
 
 
-def test_all_commands_share_endpoint(monkeypatch):
+def test_all_commands_share_endpoint():
     commands = []
+    service = _session_service(commands)
+    with running_server(service._dispatch_request) as server:
+        port = server.server_address[1]
+        # The control plane is independent of the sample stream, which is never
+        # opened here.
+        eye = MxEye(MxEyeConfig(control_port=port))
+        assert eye.start().state == "running"
+        assert eye.stop().state == "stopping"
+        assert eye.status().network.control_port == 5557
+        assert commands == [Command.START, Command.STOP]
+
+
+def _session_service(commands):
+    """A Service stub that records the commands it is given."""
     service = Service.__new__(Service)
     service.snapshot = lambda: StatusSnapshot(state="idle")
 
@@ -141,15 +155,23 @@ def test_all_commands_share_endpoint(monkeypatch):
         return result
 
     service.submit = submit
-    with running_server(service._dispatch_request) as server:
-        port = server.server_address[1]
-        client = Client(control_port=port)
-        # This test isolates command transport from the separate sample stream.
-        monkeypatch.setattr(client, "connect", lambda: client)
-        assert client.start().state == "running"
-        assert client.stop().state == "stopping"
-        assert client.status().network.control_port == 5557
-        assert commands == [Command.START, Command.STOP]
+    return service
+
+
+def test_connect_requires_a_publishing_tracker():
+    """The data port exists only while a session runs, so connect can fail."""
+    eye = MxEye(MxEyeConfig(data_port=_free_port(), control_port=_free_port()))
+    try:
+        with pytest.raises(OSError):
+            eye.connect()
+    finally:
+        eye.close()
+    unreachable = MxEye(MxEyeConfig(data_port=_free_port(), control_port=_free_port()))
+    try:
+        with pytest.raises(TimeoutError, match="did not reply"):
+            unreachable.start()
+    finally:
+        unreachable.close()
 
 
 @pytest.mark.parametrize(
@@ -177,7 +199,7 @@ def test_server_replies_to_malformed_requests(data):
             reply = receive_json(sock, Reply)
             assert not reply.ok
             assert reply.error
-        client = Client(control_port=server.server_address[1])
+        client = MxEye(MxEyeConfig(control_port=server.server_address[1]))
         assert client.status().state == "idle"
     assert len(calls) == 1
 
@@ -202,7 +224,7 @@ def test_handler_error_is_a_reply():
         raise RuntimeError("Camera unavailable")
 
     with running_server(dispatch) as server:
-        client = Client(control_port=server.server_address[1])
+        client = MxEye(MxEyeConfig(control_port=server.server_address[1]))
         with pytest.raises(RuntimeError, match="Camera unavailable"):
             client.stop()
 
@@ -247,7 +269,7 @@ def test_service_status_reconfigure_and_shutdown():
     service = Service(config)
     try:
         assert not service._server_errors
-        client = Client(control_port=config.value.network.control_port)
+        client = MxEye(MxEyeConfig(control_port=config.value.network.control_port))
         status = client.status()
         assert status.state == "idle"
         assert status.stats.acquired == 0
@@ -260,7 +282,10 @@ def test_service_status_reconfigure_and_shutdown():
         updated.value.network.control_port = _free_port()
         result = service.submit("settings", config=updated).result(timeout=3)
         assert result.network.control_port == updated.value.network.control_port
-        assert Client(control_port=result.network.control_port).status().state == "idle"
+        assert (
+            MxEye(MxEyeConfig(control_port=result.network.control_port)).status().state
+            == "idle"
+        )
     finally:
         service.close()
     assert service._server is None

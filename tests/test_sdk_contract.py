@@ -1,69 +1,84 @@
 """The surface the remote client relies on; guards API-compatible refactors."""
 
+import dataclasses
 import importlib
 import inspect
 
 import pytest
 from mx_eye_protocol.control import Transport
-from py_mx_eye import Client, Sample, Stats
+from py_mx_eye import MxEye, MxEyeConfig, Sample
 
-# Fields read by mx_eye_client.receiver.refresh().
-CONSUMER_STATS_FIELDS = {
-    "received",
-    "sequence_gaps",
-    "acquisition_skips",
-    "buffer_overwrites",
-    "error",
-}
+EYE_METHODS = (
+    "connect",
+    "read",
+    "start",
+    "stop",
+    "status",
+    "close",
+)
 
-CLIENT_METHODS = ("connect", "start", "stop", "status", "latest", "drain", "close")
+CONFIG_FIELDS = (
+    "host",
+    "data_port",
+    "control_port",
+    "transport",
+    "udp_bind",
+    "timeout",
+)
 
 
-def test_client_constructor_surface():
-    parameters = inspect.signature(Client.__init__).parameters
-    assert list(parameters)[1:8] == [
-        "host",
-        "data_port",
-        "control_port",
-        "transport",
-        "udp_bind",
-        "buffer_samples",
-        "timeout",
-    ]
-    assert parameters["timeout"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert parameters["now"].kind is inspect.Parameter.KEYWORD_ONLY
-    # The remote client passes the host and both ports positionally.
-    client = Client("10.0.0.2", 6000, 6001)
-    assert (client.host, client.data_port, client.control_port) == (
-        "10.0.0.2",
-        6000,
-        6001,
+def test_eye_takes_one_config_object():
+    """The constructor stays short; its parameters live in a dataclass."""
+    assert list(inspect.signature(MxEye.__init__).parameters)[1:] == ["config"]
+    assert [field.name for field in dataclasses.fields(MxEyeConfig)] == list(
+        CONFIG_FIELDS
     )
-    assert client.transport is None
-    assert Client(transport="udp").transport is Transport.UDP
-    assert Client(transport=Transport.TCP).transport is Transport.TCP
+    assert dataclasses.is_dataclass(MxEyeConfig)
+    assert MxEyeConfig.__dataclass_params__.frozen
 
 
-def test_client_method_surface():
-    parameters = inspect.signature(Client.latest).parameters
+def test_defaults_are_reachable_without_a_config():
+    eye = MxEye()
+    assert eye.config == MxEyeConfig()
+    assert eye.config.host == "127.0.0.1"
+    assert eye.config.data_port == 5556
+    assert eye.config.control_port == 5557
+    assert eye.config.timeout == 3.0
+    assert eye.config.transport is Transport.TCP
+
+
+def test_transport_is_always_an_explicit_enum():
+    """The handle never infers the transport; there is no None and no string."""
+    assert MxEyeConfig().transport is Transport.TCP
+    assert MxEyeConfig(transport=Transport.UDP).transport is Transport.UDP
+
+
+def test_the_handle_keeps_the_config_it_was_given():
+    """No copying and no rewriting: the config stays the single source."""
+    config = MxEyeConfig(host="10.0.0.2", transport=Transport.UDP)
+    assert MxEye(config).config is config
+
+
+def test_eye_method_surface():
+    parameters = inspect.signature(MxEye.read).parameters
+    assert parameters["timeout"].default is None
     assert parameters["max_age_ms"].default == 50.0
     assert parameters["require_valid"].default is True
-    assert all(callable(getattr(Client, name)) for name in CLIENT_METHODS)
-    client = Client()
-    assert client.latest() is None
-    assert client.drain() == []
-    assert client.stats.received == 0
+    assert all(callable(getattr(MxEye, name)) for name in EYE_METHODS)
+    # The SDK owns no thread, and the with block scopes the stream only.
+    assert callable(MxEye.__enter__)
+    assert callable(MxEye.__exit__)
+    assert not hasattr(MxEye, "session")
+    assert not hasattr(MxEye, "latest")
+    assert not hasattr(MxEye, "drain")
+    assert not hasattr(MxEye, "stats")
 
 
-def test_stats_model_covers_the_consumer():
-    stats = Client().stats
-    assert isinstance(stats, Stats)
-    assert CONSUMER_STATS_FIELDS <= set(type(stats).model_fields)
-    assert set(type(stats).model_fields) == CONSUMER_STATS_FIELDS | {
-        "malformed",
-        "out_of_order",
-    }
-    assert stats.error == ""
+def test_read_requires_a_connection():
+    """Reading is not silently empty on a handle that never connected."""
+    eye = MxEye()
+    with pytest.raises(RuntimeError, match="Connect before reading"):
+        eye.read(timeout=0.0)
 
 
 def test_sample_surface():
@@ -73,6 +88,18 @@ def test_sample_surface():
         assert isinstance(getattr(Sample, name), property)
     for name in ("age_ms_at", "is_fresh_at"):
         assert callable(getattr(Sample, name))
+
+
+def test_legacy_names_are_gone():
+    """The SDK entry point is MxEye; no alias keeps the old names alive."""
+    with pytest.raises(ImportError):
+        importlib.import_module("py_mx_eye.client")
+    with pytest.raises(ImportError):
+        from py_mx_eye import Client  # noqa: F401
+    with pytest.raises(ImportError):
+        from py_mx_eye import PyMXEye  # noqa: F401
+    with pytest.raises(ImportError):
+        from py_mx_eye import Stats  # noqa: F401
 
 
 def test_legacy_private_module_is_gone():

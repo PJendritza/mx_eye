@@ -30,9 +30,9 @@ uv run mx-eye-receiver
 uv run mx-eye --demo
 ```
 
-在追踪器中点击 **Start**。在客户端中点击 **Connect**；客户端的
-**Start tracker** 和 **Stop tracker** 按钮控制同一个会话。
-当会话已在运行时，START 是幂等的。也可以先连接客户端，再从中启动会话。
+先在追踪器中点击 **Start**，再在客户端点击 **Connect**：SDK 的数据端口只在
+会话出流期间存在，先连接会直接报连接被拒。客户端的 **Start tracker** 与
+**Stop tracker** 按钮通过控制端口操作同一个会话；当会话已在运行时，START 是幂等的。
 
 ## 时钟同步
 
@@ -49,21 +49,29 @@ scripts/check-chrony-client.sh                       # 等待并校验同步
 
 ## SDK
 
-SDK 即 `py-mx-eye` 包；`uv sync --all-extras` 会安装它。
+SDK 即 `py-mx-eye` 包；`uv sync --all-extras` 会安装它。SDK 不拥有任何线程：
+每次调用都跑在调用方线程上，因此自己持有线程的消费端始终掌控它。
 
 ```python
-from py_mx_eye import Client
+from py_mx_eye import MxEye, MxEyeConfig
 
-with Client("127.0.0.1") as eye:
-    eye.start()
-    # Inside your behavioral-task loop:
-    sample = eye.latest(max_age_ms=50)
-    if sample is not None:
+# with 块负责打开样本流，并在退出时确保释放
+with MxEye(MxEyeConfig(host="127.0.0.1")) as eye:
+    for sample in eye.read():  # 在本线程上等待每一个样本
         x, y = sample.frame.payload.x, sample.frame.payload.y
-    # At the end of the session:
-    eye.stop()
 ```
 
-在追踪器产生第一个有效样本之前，`latest()` 返回 None；坐标是未标定的源图像像素。
-一个可运行的示例：`uv run python -m mx_eye_client.receive_minimal`。
-更多细节见 AGENTS.md。
+`MxEyeConfig` 是承载连接参数的 frozen dataclass，因此构造函数只需要一个入参。
+`with` 只包裹样本流：由 `connect()` 打开（数据端口只在会话运行期间存在）、由
+`close()` 释放；采集始终通过 `start()`/`stop()` 显式控制，退出 `with` 不会停止追踪器。
+
+`read()` 只产出仍然是"当前测量"的样本：丢失、过期、无效的样本在等待过程中被跳过。
+`timeout` 限制的是**每次等待**而不是整个循环，等待超时即结束循环：因此 `read(0)`
+是不阻塞的排空（GUI 定时器用这个），有限 timeout 还会在该时长的静默后结束循环，
+默认则无限等待。传入 `max_age_ms=None, require_valid=False` 则产出下一个到达的样本，
+适合绘图与诊断。
+
+错误以异常形式暴露，而不是静默状态：追踪器未出流时 `connect()` 抛错；流被关闭或
+出错时抛 `ConnectionError`（重新 `connect()` 即可恢复）；帧格式非法时抛 `ValueError`。
+坐标是未标定的源图像像素。一个可运行的示例：
+`uv run python -m mx_eye_client.receive_minimal`。更多细节见 AGENTS.md。

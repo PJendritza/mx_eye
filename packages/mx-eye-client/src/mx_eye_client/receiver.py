@@ -8,7 +8,7 @@ from collections import deque
 import numpy as np
 import pyqtgraph as pg
 from mx_eye_protocol.control import StatusSnapshot
-from py_mx_eye import Client
+from py_mx_eye import MxEye, MxEyeConfig
 from PySide6 import QtCore as C
 from PySide6 import QtWidgets as W
 
@@ -19,11 +19,14 @@ class Receiver(W.QWidget):
     def __init__(self, host, data_port, control_port):
         super().__init__()
         self.client = None
-        self.ports = (data_port, control_port)
+        self.data_port, self.control_port = data_port, control_port
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.pending = None
         self.history = deque(maxlen=4000)
         self.session = None
+        self.coordinate_system = None
+        self.newest = None
+        self.counted = 0
         self.last = (time.monotonic(), 0)
         self.rate = 0
         self.connected = False
@@ -50,7 +53,7 @@ class Receiver(W.QWidget):
         layout.addLayout(row)
         layout.addWidget(
             label(
-                "Simulated MXBI consumer · SDK receives continuously; plots refresh at 25 Hz",
+                "Simulated MXBI consumer · synchronous reads on this thread; plots refresh at 25 Hz",
                 "muted",
             )
         )
@@ -92,15 +95,45 @@ class Receiver(W.QWidget):
     def connect_tracker(self):
         if self.client:
             self.client.close()
-        self.client = Client(self.host.text().strip(), *self.ports)
+        self.client = MxEye(
+            MxEyeConfig(
+                host=self.host.text().strip(),
+                data_port=self.data_port,
+                control_port=self.control_port,
+            )
+        )
         self.connected = False
+        self.counted = 0
+        self.newest = None
         self.run(self.client.connect)
+
+    def record(self, sample):
+        """Append one received sample to the trace, restarting on a new session."""
+        payload = sample.frame.payload
+        if (
+            payload.session != self.session
+            or payload.coordinate_system != self.coordinate_system
+        ):
+            self.history.clear()
+            self.session = payload.session
+            self.coordinate_system = payload.coordinate_system
+            self.plot.setTitle(
+                payload.coordinate_system.replace("_", " ") + " · pixels"
+            )
+        self.history.append(
+            (
+                sample.receive_ns / 1e9,
+                payload.x,
+                payload.y,
+                sample.arrival_age_ms,
+            )
+        )
 
     def refresh(self):
         if self.pending and self.pending.done():
             try:
                 reply = self.pending.result()
-                if isinstance(reply, Client):
+                if isinstance(reply, MxEye):
                     self.connected = True
                     self.state.setText("Connected")
                 elif isinstance(reply, StatusSnapshot):
@@ -118,42 +151,33 @@ class Receiver(W.QWidget):
         self.connect_button.setEnabled(self.pending is None)
         for button in (self.start_button, self.stop_button):
             button.setEnabled(self.client is not None and self.pending is None)
-        if self.client is None:
+        if not self.connected:
             return
         now = time.monotonic()
-        samples = self.client.drain()
-        for sample in samples:
-            if (
-                sample.frame.payload.session != self.session
-                or sample.frame.payload.coordinate_system
-                != getattr(self, "coordinate_system", None)
+        newest = None
+        try:
+            # Diagnostic mode takes every sample received, valid or not, and
+            # timeout 0 keeps this GUI thread from ever blocking.
+            for sample in self.client.read(
+                timeout=0.0, max_age_ms=None, require_valid=False
             ):
-                self.history.clear()
-                self.session = sample.frame.payload.session
-                self.coordinate_system = sample.frame.payload.coordinate_system
-                self.plot.setTitle(
-                    sample.frame.payload.coordinate_system.replace("_", " ")
-                    + " · pixels"
-                )
-            self.history.append(
-                (
-                    sample.receive_ns / 1e9,
-                    sample.frame.payload.x,
-                    sample.frame.payload.y,
-                    sample.arrival_age_ms,
-                )
-            )
-        stats = self.client.stats
+                newest = sample
+                self.counted += 1
+                self.record(sample)
+        except (ConnectionError, RuntimeError) as exc:
+            self.connected = False
+            self.state.setText(str(exc))
         last, count = self.last
         if now - last > 0.5:
-            self.rate = (stats.received - count) / (now - last)
-            self.last = (now, stats.received)
-        sample = self.client.latest(max_age_ms=None, require_valid=False)
+            self.rate = (self.counted - count) / (now - last)
+            self.last = (now, self.counted)
+        sample = newest if newest is not None else self.newest
+        self.newest = sample
 
         def number(value):
             return f"{value:.2f}" if math.isfinite(value) else "—"
 
-        if sample:
+        if sample is not None:
             stale = not math.isfinite(sample.age_ms) or sample.age_ms > 100
             validity = (
                 "STALE"
@@ -164,10 +188,8 @@ class Receiver(W.QWidget):
                 f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.frame.payload.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
             )
         self.info.setText(
-            f"packet gaps {stats.sequence_gaps} · unprocessed source frames ≥{stats.acquisition_skips} · buffer overwrites {stats.buffer_overwrites}\nDelay is measured from host read-return timestamps shared by both ends; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."
+            "Delay is measured from host read-return timestamps shared by both ends; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."
         )
-        if stats.error:
-            self.state.setText(stats.error)
         if self.history:
             data = np.asarray(self.history)
             # Sample timestamps and this window share the tracker's wall clock.

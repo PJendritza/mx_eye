@@ -57,20 +57,13 @@ def test_a_frame_is_returned_only_by_the_byte_that_completes_it():
         if assembler.feed(byte) is not None:
             completed_at.append(index)
     assert completed_at == [FRAME_BYTES - 1, 2 * FRAME_BYTES - 1]
-    assert assembler.pending == 0
 
 
-def test_a_partial_frame_reports_its_progress():
+def test_a_partial_frame_is_not_returned_until_it_completes():
     frame = _frames(1)[0]
     assembler = FrameAssembler()
-    assert [assembler.feed(byte) for byte in frame[:10]] == [None] * 10
-    assert assembler.pending == 10
-    assert [assembler.feed(byte) for byte in frame[10:-1]] == [None] * (
-        FRAME_BYTES - 11
-    )
-    assert assembler.pending == FRAME_BYTES - 1
+    assert [assembler.feed(byte) for byte in frame[:-1]] == [None] * (FRAME_BYTES - 1)
     assert assembler.feed(frame[-1]) == frame
-    assert assembler.pending == 0
 
 
 @pytest.mark.parametrize("size", [1, 5, 10, FRAME_BYTES, 1000])
@@ -81,7 +74,6 @@ def test_the_callers_chunking_does_not_matter(size):
     for start in range(0, len(stream), size):
         produced.extend(_run(assembler, stream[start : start + size]))
     assert produced == _frames(3)
-    assert assembler.pending == 0
 
 
 def test_reset_discards_a_partial_frame():
@@ -89,7 +81,6 @@ def test_reset_discards_a_partial_frame():
     assembler = FrameAssembler()
     _run(assembler, partial[:50])
     assembler.reset()
-    assert assembler.pending == 0
     assert _run(assembler, complete) == [complete]
 
 
@@ -101,6 +92,7 @@ def test_reset_discards_a_partial_frame():
         HEADER.pack(b"MXEY", MessageType.CMD, 97),
         HEADER.pack(b"MXEY", MessageType.DATA, 0),
         HEADER.pack(b"MXEY", MessageType.DATA, 0xFFFFFFFF),
+        HEADER.pack(b"MXEY", MessageType.DATA, 0xFFFFFFF0),
     ],
 )
 def test_a_malformed_header_raises_and_clears_the_buffer(bad_header):
@@ -108,8 +100,8 @@ def test_a_malformed_header_raises_and_clears_the_buffer(bad_header):
     assembler = FrameAssembler()
     with pytest.raises(FrameError):
         _run(assembler, bad_header + first)
-    # The stream boundary is lost: nothing may be reused from the old buffer.
-    assert assembler.pending == 0
+    # The stream boundary is lost: the old buffer may not be reused, so the
+    # assembler has to start again from a clean header.
     assert _run(assembler, second) == [second]
 
 
@@ -125,15 +117,7 @@ def test_a_valid_prefix_before_a_fault_is_still_delivered():
                 produced.append(frame)
     # The good frame completed before the faulty header, so it is not thrown away.
     assert produced == [first]
-    assert assembler.pending == 0
     assert _run(assembler, second) == [second]
-
-
-def test_an_oversized_declared_length_is_rejected_without_buffering():
-    assembler = FrameAssembler()
-    with pytest.raises(FrameError):
-        _run(assembler, HEADER.pack(b"MXEY", MessageType.DATA, 0xFFFFFFF0))
-    assert assembler.pending == 0
 
 
 def test_frame_error_is_an_error_and_a_value_error():

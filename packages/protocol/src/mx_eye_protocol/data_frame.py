@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag, auto
 from typing import ClassVar
 
+from pydantic import BaseModel, ConfigDict
+
 
 class MessageType(IntEnum):
     """Message kinds in the shared frame header; CMD is reserved for control."""
@@ -30,8 +32,37 @@ class TrackingFlags(IntFlag):
     )  # Pupil-only x/y use the ROI origin instead of the image origin.
 
 
-@dataclass(frozen=True)
-class TrackingPayload:
+# Tracking wire order: every payload field with its struct code, in byte order.
+# The struct format, its size and the decode field list all derive from this one
+# declaration, so the codec cannot disagree with itself. Little endian, like
+# HEADER: seven uint64, signed media time, eight float32, uint8 flags.
+_TRACKING_LAYOUT: tuple[tuple[str, str], ...] = (
+    ("session", "Q"),
+    ("sequence", "Q"),
+    ("frame", "Q"),
+    ("acquisition_ns", "Q"),
+    ("tracking_start_ns", "Q"),
+    ("tracking_end_ns", "Q"),
+    ("send_ns", "Q"),
+    ("media_ns", "q"),
+    ("x", "f"),
+    ("y", "f"),
+    ("pupil_x", "f"),
+    ("pupil_y", "f"),
+    ("cr_x", "f"),
+    ("cr_y", "f"),
+    ("pupil_area", "f"),
+    ("template_ncc", "f"),
+    ("flags", "B"),
+)
+
+# Payload field names in wire order, for a caller decoding a payload itself.
+TRACKING_FIELDS: tuple[str, ...] = tuple(name for name, _ in _TRACKING_LAYOUT)
+
+_TRACKING_FORMAT = "<" + "".join(code for _, code in _TRACKING_LAYOUT)
+
+
+class TrackingPayload(BaseModel):
     """One tracking sample, independent of its serialized representation.
 
     Timestamps except media_ns are nanoseconds from the shared wall clock
@@ -39,7 +70,12 @@ class TrackingPayload:
     PTP; they are not a monotonic uptime clock. media_ns is a media position.
     Coordinates are uncalibrated source-image pixels: x rightward, y downward.
     Missing detections and invalid output coordinates are represented by NaN.
+
+    Field order is the wire order; the declared types decode a payload, so for
+    example the raw flags byte becomes a TrackingFlags member.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     session: int  # Random 64-bit ID generated when a tracking session starts.
     sequence: int  # 1-based tracking-sample counter within the session.
@@ -108,8 +144,7 @@ class DataFrame:
 
     # Little endian: magic, uint8 message type, uint32 encoded payload length.
     HEADER: ClassVar[struct.Struct] = struct.Struct("<4sBI")
-    # Seven uint64 values, signed media time, eight float32 values, uint8 flags.
-    TRACKING: ClassVar[struct.Struct] = struct.Struct("<7Qq8fB")
+    TRACKING: ClassVar[struct.Struct] = struct.Struct(_TRACKING_FORMAT)
     header_size: ClassVar[int] = HEADER.size
 
     @classmethod
@@ -124,25 +159,8 @@ class DataFrame:
     def encode(self) -> bytes:
         """Serialize the frame fields without receiver-side protocol validation."""
         header = self.HEADER.pack(self.magic, self.message_type, self.length)
-        payload = self.payload
         body = self.TRACKING.pack(
-            payload.session,
-            payload.sequence,
-            payload.frame,
-            payload.acquisition_ns,
-            payload.tracking_start_ns,
-            payload.tracking_end_ns,
-            payload.send_ns,
-            payload.media_ns,
-            payload.x,
-            payload.y,
-            payload.pupil_x,
-            payload.pupil_y,
-            payload.cr_x,
-            payload.cr_y,
-            payload.pupil_area,
-            payload.template_ncc,
-            int(payload.flags),
+            *(getattr(self.payload, name) for name in TRACKING_FIELDS)
         )
         return header + body
 

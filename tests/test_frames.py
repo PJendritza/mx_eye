@@ -9,7 +9,13 @@ from dataclasses import replace
 
 import pytest
 from mx_eye.recording import TRACKING_COLUMNS, tracking_row
-from mx_eye_protocol import DataFrame, MessageType, TrackingFlags, TrackingPayload
+from mx_eye_protocol import (
+    TRACKING_FIELDS,
+    DataFrame,
+    MessageType,
+    TrackingFlags,
+    TrackingPayload,
+)
 from py_mx_eye import Sample
 from py_mx_eye.receiver import decode_frame, decode_header
 
@@ -64,6 +70,16 @@ def test_fixed_bytes(payload):
     assert frame.encode() == FRAME_BYTES
     assert frame == DataFrame(message_type=MessageType.DATA, length=97, payload=payload)
     assert outgoing.frame_size == len(FRAME_BYTES)
+
+
+def test_wire_field_order_is_declared_once():
+    """Model order, decode field list and struct arity share one declaration."""
+    assert TRACKING_FIELDS == tuple(TrackingPayload.model_fields)
+    assert DataFrame.TRACKING.size == 97
+    # The strict zip in decode_frame relies on these two counts agreeing.
+    assert len(DataFrame.TRACKING.unpack(bytes(DataFrame.TRACKING.size))) == len(
+        TRACKING_FIELDS
+    )
 
 
 def test_auto_enum_wire_values():
@@ -134,7 +150,9 @@ def test_old_v1_frame_rejected():
 def test_float32_and_missing_values(payload):
     decoded = decode_frame(
         DataFrame.from_payload(
-            replace(payload, x=0.1, cr_x=math.nan, flags=TrackingFlags.VALID)
+            payload.model_copy(
+                update={"x": 0.1, "cr_x": math.nan, "flags": TrackingFlags.VALID}
+            )
         ).encode()
     ).payload
     assert decoded.x == 0.10000000149011612
@@ -152,28 +170,31 @@ def test_float32_and_missing_values(payload):
     ],
 )
 def test_coordinates(payload, flags, coordinates):
-    assert replace(payload, flags=flags).coordinate_system == coordinates
+    assert payload.model_copy(update={"flags": flags}).coordinate_system == coordinates
 
 
 def test_measurements_and_validity(payload):
-    frame = replace(
-        payload,
-        acquisition_ns=1_000_000,
-        tracking_start_ns=2_000_000,
-        tracking_end_ns=4_000_000,
-        send_ns=5_000_000,
+    frame = payload.model_copy(
+        update={
+            "acquisition_ns": 1_000_000,
+            "tracking_start_ns": 2_000_000,
+            "tracking_end_ns": 4_000_000,
+            "send_ns": 5_000_000,
+        }
     )
     assert frame.valid
     assert frame.queue_ms == 1
     assert frame.processing_ms == 2
     assert frame.acquisition_to_send_ms == 4
-    assert not replace(frame, flags=TrackingFlags.NONE).valid
-    assert not replace(frame, x=math.nan).valid
-    assert not replace(frame, y=math.inf).valid
+    assert not frame.model_copy(update={"flags": TrackingFlags.NONE}).valid
+    assert not frame.model_copy(update={"x": math.nan}).valid
+    assert not frame.model_copy(update={"y": math.inf}).valid
 
 
 def _timed_sample(payload):
-    payload = replace(payload, acquisition_ns=2_000_000, send_ns=5_000_000)
+    payload = payload.model_copy(
+        update={"acquisition_ns": 2_000_000, "send_ns": 5_000_000}
+    )
     frame = DataFrame(message_type=MessageType.DATA, length=97, payload=payload)
     return Sample(frame=frame, receive_ns=7_000_000)
 
@@ -202,7 +223,9 @@ def test_sample_freshness(payload):
         sample,
         frame=replace(
             sample.frame,
-            payload=replace(sample.frame.payload, flags=TrackingFlags.NONE),
+            payload=sample.frame.payload.model_copy(
+                update={"flags": TrackingFlags.NONE}
+            ),
         ),
     )
     assert not lost.is_fresh_at(10_000_000, max_age_ms=10)
@@ -246,7 +269,7 @@ def test_payload_cross_process_and_csv(payload):
         ),
         "1,2,3,4,5,6,7,-1,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,63",
     ]
-    precise = replace(payload, x=0.1, cr_x=math.nan)
+    precise = payload.model_copy(update={"x": 0.1, "cr_x": math.nan})
     row = dict(zip(TRACKING_COLUMNS, tracking_row(precise)))
     assert row["x"] == 0.1
     assert math.isnan(row["cr_x"])

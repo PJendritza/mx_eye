@@ -13,6 +13,7 @@ EYE_METHODS = (
     "start",
     "stop",
     "status",
+    "start_calibration",
     "close",
 )
 
@@ -21,6 +22,7 @@ CONFIG_FIELDS = (
     "data_port",
     "control_port",
     "timeout",
+    "calibration_port",
 )
 
 
@@ -41,6 +43,7 @@ def test_defaults_are_reachable_without_a_config():
     assert eye.config.data_port == 5556
     assert eye.config.control_port == 5557
     assert eye.config.timeout == 3.0
+    assert eye.config.calibration_port == 5558
 
 
 def test_the_handle_keeps_the_config_it_was_given():

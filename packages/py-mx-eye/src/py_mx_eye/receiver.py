@@ -36,8 +36,8 @@ class SampleReceiver:
     """One subscriber, opened, read and closed on the caller's thread."""
 
     def __init__(self, config: ReceiverConfig) -> None:
-        self.host = config.host
-        self.port = config.port
+        self.host: str = config.host
+        self.port: int = config.port
         self._context: zmq.Context[zmq.Socket[bytes]] | None = None
         self._sock: zmq.Socket[bytes] | None = None
         self._session: int | None = None

@@ -242,10 +242,11 @@ to the unchanged CSV columns, without a float32 round trip.
 Control uses one UTF-8 JSON frame per request and reply, without newline
 delimiters or binary headers. Endpoints use Pydantic JSON serialization and
 validation directly, with no application-level message size cap. ControlRequest/ControlReply and nested status
-remain Pydantic models with control protocol SemVer `1.0.0`. Command and
+remain Pydantic models with control protocol SemVer `1.1.0`. Older control
+versions are rejected. Command and
 SourceMode use lowercase StrEnum values. Successful replies contain `ok: true`
 and `status`; errors contain `ok: false` and `error`. For example, a request is
-`{"command":"status","protocol":"1.0.0"}`.
+`{"command":"status","protocol":"1.1.0"}`.
 
 One worker thread owns the REP socket and handles commands serially. Start/stop
 wait for the existing operation result; other requests queue meanwhile and may

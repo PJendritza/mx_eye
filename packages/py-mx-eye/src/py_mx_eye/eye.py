@@ -17,8 +17,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Self
 
-from mx_eye_protocol.control import Command, StatusSnapshot
+from mx_eye_protocol.calibration import CalibrationConfig, CalibrationState
+from mx_eye_protocol.control import Command, ControlRequest, StatusSnapshot
 
+from .calibration import CalibrationClient, CalibrationSession, calibration_result
 from .control import ControlClient
 from .receiver import ReceiverConfig, SampleReceiver
 from .sample import Sample
@@ -35,17 +37,20 @@ class MxEyeConfig:
     data_port: int = 5556
     control_port: int = 5557
     timeout: float = 3.0
+    calibration_port: int = 5558
 
 
 class MxEye:
     """Synchronous receiver for one tracker, with an explicit lifecycle."""
 
     def __init__(self, config: MxEyeConfig | None = None) -> None:
-        self.config = config if config is not None else MxEyeConfig()
+        self.config: MxEyeConfig = config if config is not None else MxEyeConfig()
         self._connected = False
         self._control = ControlClient(
             self.config.host, self.config.control_port, self.config.timeout
         )
+        self._calibration: CalibrationSession | None = None
+        self._starting_calibration: CalibrationConfig | None = None
         self._receiver = SampleReceiver(
             ReceiverConfig(
                 host=self.config.host,
@@ -111,10 +116,52 @@ class MxEye:
     def status(self) -> StatusSnapshot:
         return self._control.request_status(Command.STATUS)
 
+    def start_calibration(self, config: CalibrationConfig) -> CalibrationSession:
+        """Start stimulus submission, independently of acquisition and read().
+
+        Reuse config after an uncertain start to retry the same calibration ID.
+        A tracker must implement calibration protocol 1.1.0 and the data port.
+        """
+        if self._calibration is not None and not self._calibration.finished:
+            raise RuntimeError("A calibration session is already active")
+        if (
+            self._starting_calibration is not None
+            and config != self._starting_calibration
+        ):
+            raise RuntimeError(
+                "Retry the pending calibration start with the same config"
+            )
+        self._starting_calibration = config.model_copy(deep=True)
+        request = ControlRequest(
+            command=Command.CALIBRATION_START,
+            calibration_start=self._starting_calibration,
+        )
+        try:
+            reply = self._control.rpc(request)
+        except RuntimeError:
+            self._starting_calibration = None
+            raise
+        result = calibration_result(
+            reply, config.calibration_id, CalibrationState.ACTIVE
+        )
+        self._calibration = CalibrationSession(
+            self._starting_calibration,
+            result,
+            self._control,
+            CalibrationClient(
+                self.config.host, self.config.calibration_port, self.config.timeout
+            ),
+        )
+        self._starting_calibration = None
+        return self._calibration
+
     def close(self) -> None:
         """Release the sample stream. Does not stop the tracker."""
         self._receiver.close()
         self._connected = False
+        if self._calibration is not None:
+            self._calibration.close()
+        self._starting_calibration = None
 
     def __enter__(self) -> Self:
         return self.connect()

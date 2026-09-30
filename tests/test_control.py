@@ -48,8 +48,8 @@ def test_typed_json_round_trip():
     assert decoded.status.source.mode is SourceMode.CAMERA
     request = ControlRequest.model_validate_json('{"command":"status"}')
     assert request.command is Command.STATUS
-    assert request.protocol == "1.0.0"
-    assert '"protocol":"1.0.0"' in request.model_dump_json()
+    assert request.protocol == "1.1.0"
+    assert '"protocol":"1.1.0"' in request.model_dump_json()
 
 
 def test_config_and_sdk_share_protocol_enums():
@@ -68,6 +68,7 @@ def test_config_and_sdk_share_protocol_enums():
         "1.0",
         "01.0.0",
         "1.0.1",
+        "1.0.0",
         "2.0.0",
         "1.0.0-rc.1",
     ],

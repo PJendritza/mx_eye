@@ -6,11 +6,15 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .calibration import CalibrationConfig, CalibrationStatus, CalibrationStop
+
 
 class Command(StrEnum):
     STATUS = auto()
     START = auto()
     STOP = auto()
+    CALIBRATION_START = auto()
+    CALIBRATION_STOP = auto()
 
 
 class SourceMode(StrEnum):
@@ -74,13 +78,32 @@ class StatusSnapshot(ControlModel):
     source: SourceStatus = Field(default_factory=SourceStatus)
     priority: list[str] = Field(default_factory=list)
     server_errors: list[str] = Field(default_factory=list)
+    calibration: CalibrationStatus | None = None
 
 
 class ControlRequest(ControlModel):
     """One command sent by a REQ socket to the control service."""
 
     command: Command
-    protocol: Literal["1.0.0"] = "1.0.0"  # Supported control protocol SemVer.
+    protocol: Literal["1.1.0"] = "1.1.0"
+    calibration_start: CalibrationConfig | None = None
+    calibration_stop: CalibrationStop | None = None
+
+    @model_validator(mode="after")
+    def validate_calibration_command(self) -> "ControlRequest":
+        if (self.calibration_start is not None) != (
+            self.command is Command.CALIBRATION_START
+        ):
+            raise ValueError(
+                "calibration_start is required only for calibration_start commands"
+            )
+        if (self.calibration_stop is not None) != (
+            self.command is Command.CALIBRATION_STOP
+        ):
+            raise ValueError(
+                "calibration_stop is required only for calibration_stop commands"
+            )
+        return self
 
 
 class ControlReply(ControlModel):

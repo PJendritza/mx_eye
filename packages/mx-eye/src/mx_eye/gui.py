@@ -18,7 +18,6 @@ from .config import (
     PUPIL_METHODS,
     PupilMethod,
     PupilCoordinates,
-    RecordingCodec,
     SourceMode,
     TrackingMode,
     Transport,
@@ -29,7 +28,6 @@ from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
     ("network", "transport"): Transport,
-    ("recording", "codec"): RecordingCodec,
 }
 
 
@@ -64,8 +62,6 @@ class Settings(W.QDialog):
                 [
                     ("directory", "Output folder", None),
                     ("buffer_mb", "Buffer size (MiB)", 8, 2048),
-                    ("codec", "Codec", [item.value for item in RecordingCodec]),
-                    ("camera_mjpeg_passthrough", "Use original camera MJPEG when available", True),
                 ],
             ),
             "View": (
@@ -83,7 +79,7 @@ class Settings(W.QDialog):
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
             "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. UDP sends to one configured receiver. Control is unauthenticated: use only your trusted local network.",
-            "Recording": "MJPG: fast, lossy AVI. FFV1: lossless MKV, higher CPU demand. Full source frames are saved without overlays. Buffer overflow stops recording and marks the session incomplete; tracking continues.",
+            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, recording stops and is marked incomplete; tracking continues.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }
         for title, (group, rows) in specs.items():
@@ -258,6 +254,10 @@ class Window(W.QMainWindow):
         source_row.addWidget(self.source_label, 1)
         self.requested_fps = label("", "muted")
         source_row.addWidget(self.requested_fps)
+        self.playback_note = label("", "muted")
+        self.playback_note.setStyleSheet("color:#f0ad74;")
+        layout.addWidget(self.playback_note)
+        self.playback_note.hide()
         layout.addLayout(source_row)
         self.file_menu = self.menuBar().addMenu("File")
         for title, callback in [
@@ -1003,7 +1003,23 @@ class Window(W.QMainWindow):
             name, C.Qt.ElideMiddle, max(0, self.source_label.width())))
         self.source_label.setToolTip(self.saved_source_path if mode is SourceMode.VIDEO else name)
         fps = state.source.fps if mode is SourceMode.VIDEO else source.fps
-        self.requested_fps.setText(f"{fps:g} fps" + (" requested" if mode is SourceMode.CAMERA else ""))
+        if mode is SourceMode.VIDEO:
+            timing = self.service.video_timing_info
+            self.requested_fps.setText("Timestamped recording" if timing == "Acquisition timestamps"
+                                      else f"{fps:g} fps nominal" if fps else "Timestamped video")
+            self.requested_fps.setToolTip(timing or "Reading video timing…")
+        else:
+            self.requested_fps.setText(f"{fps:g} fps" + (" requested" if mode is SourceMode.CAMERA else ""))
+            self.requested_fps.setToolTip("")
+        info = self.service.playback_info
+        achieved, requested = info.get("achieved"), info.get("requested")
+        limited = (mode is SourceMode.VIDEO and state.state == "running" and not state.paused
+                   and achieved is not None and requested is not None
+                   and abs(requested - self.speed.value()) < 1e-6
+                   and achieved < requested * 0.95 and self.navigation_pending is None)
+        self.playback_note.setVisible(limited)
+        if limited:
+            self.playback_note.setText(f"Playback limited: {achieved:.2f}× achieved / {requested:.2f}× requested")
         active = state.state in ("running", "starting", "stopping")
         self.start_button.setText("Stop" if active else "Start")
         self.start_button.setEnabled(not self.pending and state.state != "stopping")
@@ -1012,6 +1028,7 @@ class Window(W.QMainWindow):
         run = self.service.run
         recording = bool(run and run["recording"].is_set())
         draining = bool(run and not recording and not run["writer_done"].is_set())
+        self.record_button.setToolTip(self.service.recording_path_info or "Automatic MKV recording: MJPEG copy or lossless FFV1")
         self.record_button.setText("■ Stop recording" if recording else "Finalizing…" if draining else "● Record")
         self.record_button.setEnabled(state.state == "running" and mode is not SourceMode.VIDEO
                                       and not draining and not self.pending and not state.stats.record_fault)
@@ -1191,12 +1208,16 @@ class Window(W.QMainWindow):
                 self.pupil_method.setCurrentIndex(self.pupil_method.findData(tracking.pupil_method.value))
             self.update_method_controls()
         if payload["frame_id"] != self.last_history_frame:
-            self.history.append((time.monotonic(), r["x"], r["y"]))
+            position_time = payload["media_ns"] / 1e9 if video else time.monotonic()
+            if video and self.history and position_time < self.history[-1][0]:
+                self.history.clear()
+            self.history.append((position_time, r["x"], r["y"]))
             self.last_history_frame = payload["frame_id"]
         if self.history:
             data = np.asarray(self.history)
-            data = data[data[:, 0] > time.monotonic() - 8]
-            times = data[:, 0] - time.monotonic()
+            plot_now = payload["media_ns"] / 1e9 if video else time.monotonic()
+            data = data[data[:, 0] > plot_now - 8]
+            times = data[:, 0] - plot_now
             self.tx.setData(times, data[:, 1], connect="finite")
             self.ty.setData(times, data[:, 2], connect="finite")
             self.trace.setXRange(-8, 0, padding=0)

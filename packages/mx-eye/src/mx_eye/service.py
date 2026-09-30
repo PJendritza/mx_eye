@@ -25,6 +25,7 @@ from mx_eye_protocol.control import (
 
 from .config import MxEyeConfigStore, SourceMode
 from .control_server import ControlServer
+from .video import VideoReader
 from .pipeline import (
     FrameRing,
     Mailbox,
@@ -71,6 +72,8 @@ class Service:
         self.source_info = {}
         self.camera_control_info = ""
         self.recording_path_info = ""
+        self.video_timing_info = ""
+        self.playback_info = {}
         self.priority_info = []
         self._server_errors = []
         self._server = None
@@ -196,16 +199,11 @@ class Service:
             raise RuntimeError("; ".join(self._server_errors))
         s = config.value.source
         if s.mode is SourceMode.VIDEO:
-            cap = cv2.VideoCapture(s.path)
+            reader = VideoReader(s.path, threading.Event())
             try:
-                if not cap.isOpened():
-                    raise ValueError("Choose an existing, readable video file.")
-                width, height = (
-                    int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                )
+                width, height = reader.width, reader.height
             finally:
-                cap.release()
+                reader.close()
         else:
             width, height = max(s.width, 1280), max(s.height, 800)
         if not 0 < width <= 16384 or not 0 < height <= 16384:
@@ -244,6 +242,8 @@ class Service:
         self.source_info = {}
         self.camera_control_info = ""
         self.recording_path_info = ""
+        self.video_timing_info = ""
+        self.playback_info = {}
         self._preview = None
         self.directory = ""
         self.state, self.message = "starting", "Opening source…"
@@ -401,6 +401,8 @@ class Service:
                 kind = e["kind"]
                 if kind in ("error", "record_error"):
                     self.message = e["message"]
+                elif kind == "playback":
+                    self.playback_info = {"achieved": e.get("achieved"), "requested": e.get("requested")}
                 elif kind == "priority":
                     self.priority_info.append(e["message"])
                 elif kind == "template":
@@ -410,6 +412,8 @@ class Service:
                                              if k in SourceStatus.model_fields})
                     if "camera_controls" in e:
                         self.camera_control_info = e["camera_controls"]
+                    if "video_timing" in e:
+                        self.video_timing_info = e["video_timing"]
                     if "recording_path" in e:
                         self.recording_path_info = e["recording_path"]
                 elif kind.endswith("_ready"):

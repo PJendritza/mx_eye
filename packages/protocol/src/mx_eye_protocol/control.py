@@ -1,4 +1,4 @@
-"""Typed JSON requests and responses for the single command TCP endpoint."""
+"""Typed JSON requests and responses for the single command REQ/REP endpoint."""
 
 from enum import StrEnum, auto
 from ipaddress import IPv4Address
@@ -11,11 +11,6 @@ class Command(StrEnum):
     STATUS = auto()
     START = auto()
     STOP = auto()
-
-
-class Transport(StrEnum):
-    TCP = auto()
-    UDP = auto()
 
 
 class SourceMode(StrEnum):
@@ -53,8 +48,6 @@ class NetworkStatus(ControlModel):
     bind: IPv4Address = IPv4Address("127.0.0.1")
     data_port: int = 5556
     control_port: int = 5557
-    transport: Transport = Transport.TCP
-    udp_host: IPv4Address = IPv4Address("127.0.0.1")
 
 
 class SourceStatus(ControlModel):
@@ -83,12 +76,14 @@ class StatusSnapshot(ControlModel):
     server_errors: list[str] = Field(default_factory=list)
 
 
-class Request(ControlModel):
+class ControlRequest(ControlModel):
+    """One command sent by a REQ socket to the control service."""
+
     command: Command
     protocol: Literal["1.0.0"] = "1.0.0"  # Supported control protocol SemVer.
 
 
-class Reply(ControlModel):
+class ControlReply(ControlModel):
     """One response: a status snapshot or an error."""
 
     ok: bool = True
@@ -96,7 +91,7 @@ class Reply(ControlModel):
     error: str | None = None
 
     @model_validator(mode="after")
-    def validate_result(self) -> "Reply":
+    def validate_result(self) -> "ControlReply":
         if self.ok:
             if self.status is None or self.error is not None:
                 raise ValueError("A successful reply must contain exactly one result")

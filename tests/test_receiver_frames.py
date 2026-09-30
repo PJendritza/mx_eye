@@ -1,202 +1,143 @@
-"""Synchronous data plane: framing, filtering, timeouts and stream failure.
+"""Real ZeroMQ message boundaries, broadcast, session policy and reconnects."""
 
-SampleReceiver is driven directly over real sockets: a socketpair for TCP and a
-bound datagram socket for UDP. The public MxEye path is covered in
-test_sdk_read.py, and byte-at-a-time framing in test_framing.py.
-"""
-
-import socket
-import struct
 import time
+from contextlib import contextmanager
 
 import pytest
-from mx_eye_protocol import DataFrame, MessageType, TrackingFlags, TrackingPayload
-from mx_eye_protocol.control import Transport
-from py_mx_eye.receiver import FrameError, ReceiverConfig, SampleReceiver
-
-HEADER = struct.Struct("<4sBI")
-
-
-def _payload(
-    sequence: int, session: int = 1, source_frame: int | None = None
-) -> TrackingPayload:
-    return TrackingPayload(
-        session=session,
-        sequence=sequence,
-        frame=sequence if source_frame is None else source_frame,
-        acquisition_ns=1,
-        tracking_start_ns=2,
-        tracking_end_ns=3,
-        send_ns=4,
-        media_ns=-1,
-        x=1.0,
-        y=2.0,
-        pupil_x=3.0,
-        pupil_y=4.0,
-        cr_x=5.0,
-        cr_y=6.0,
-        pupil_area=7.0,
-        template_ncc=0.5,
-        flags=TrackingFlags.VALID,
-    )
+import zmq
+from mx_eye.transport import Publisher
+from py_mx_eye.receiver import ReceiverConfig, SampleReceiver
+from test_sdk_read import _frame, _free_port
 
 
-def _frame(*payloads: TrackingPayload) -> bytes:
-    return b"".join(DataFrame.from_payload(payload).encode() for payload in payloads)
+def ready(publisher, receiver, session=1):
+    """Probe the actual subscription, without a fixed slow-joiner sleep."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        publisher.send(_frame(0, session=session))
+        if receiver.next_sample(0.02) is not None:
+            return
+    pytest.fail("Subscriber did not receive the readiness probe")
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _tcp_receiver() -> tuple[SampleReceiver, socket.socket]:
-    """A receiver reading one end of a connected socketpair."""
-    peer, sender = socket.socketpair()
-    receiver = SampleReceiver(
-        ReceiverConfig(
-            host="127.0.0.1",
-            port=5556,
-            connect=lambda address, timeout: peer,
-        )
-    )
-    receiver.open(Transport.TCP, 1.0)
-    return receiver, sender
-
-
-def _udp_receiver() -> tuple[SampleReceiver, socket.socket, int]:
-    """A receiver bound to a datagram port, plus a socket that can send to it."""
+@contextmanager
+def stream():
     port = _free_port()
-    receiver = SampleReceiver(ReceiverConfig(host="127.0.0.1", port=port))
-    receiver.open(Transport.UDP, 1.0)
-    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    return receiver, sender, port
-
-
-def _sequences(receiver: SampleReceiver, timeout: float = 0.05) -> list[int]:
-    """Read until nothing arrives within the timeout."""
-    seen: list[int] = []
-    while (sample := receiver.next_sample(timeout)) is not None:
-        seen.append(sample.frame.payload.sequence)
-    return seen
-
-
-def test_one_frame_per_call():
-    receiver, sender = _tcp_receiver()
+    publisher = Publisher("127.0.0.1", port)
+    receiver = SampleReceiver(ReceiverConfig("127.0.0.1", port))
     try:
-        sender.sendall(_frame(_payload(1), _payload(2)))
-        first = receiver.next_sample(1.0)
-        second = receiver.next_sample(1.0)
-        assert first is not None and first.frame.payload.sequence == 1
-        assert second is not None and second.frame.payload.sequence == 2
-        assert first.receive_ns > 0
+        receiver.open()
+        ready(publisher, receiver)
+        yield publisher, receiver, port
     finally:
         receiver.close()
-        sender.close()
+        publisher.close()
 
 
-def test_zero_timeout_polls_and_times_out_without_blocking():
-    receiver, sender = _tcp_receiver()
+def test_messages_are_not_split_or_coalesced():
+    with stream() as (publisher, receiver, _):
+        for sequence in range(1, 4):
+            publisher.send(_frame(sequence))
+        assert [receiver.next_sample(1).frame.sequence for _ in range(3)] == [
+            1,
+            2,
+            3,
+        ]
+        assert receiver.next_sample(0) is None
+
+
+def test_bad_messages_and_multipart_are_dropped_without_losing_next_message():
+    with stream() as (publisher, receiver, _):
+        for data in (b"", b"bad", _frame(1)[:-1], _frame(1) + b"x", _frame(1) * 2):
+            publisher.send(data)
+        publisher._sock.send_multipart([_frame(1), _frame(2)])
+        publisher.send(_frame(3))
+        assert receiver.next_sample(1).frame.sequence == 3
+        assert receiver.next_sample(0) is None
+
+
+def test_duplicate_out_of_order_and_old_sessions_are_skipped():
+    with stream() as (publisher, receiver, _):
+        for session, sequence in [(1, 2), (1, 2), (1, 1), (2, 1), (1, 3), (2, 2)]:
+            publisher.send(_frame(sequence, session=session))
+        observed = [receiver.next_sample(1).frame for _ in range(3)]
+        assert [(p.session, p.sequence) for p in observed] == [(1, 2), (2, 1), (2, 2)]
+        assert receiver.next_sample(0) is None
+
+
+def test_multiple_subscribers_receive_the_same_sample():
+    with stream() as (publisher, receiver, port):
+        second = SampleReceiver(ReceiverConfig("127.0.0.1", port))
+        try:
+            second.open()
+            ready(publisher, second)
+            publisher.send(_frame(1))
+            assert receiver.next_sample(1).frame == second.next_sample(1).frame
+        finally:
+            second.close()
+
+
+def test_subscriber_connects_before_start_and_follows_publisher_restart():
+    port = _free_port()
+    receiver = SampleReceiver(ReceiverConfig("127.0.0.1", port))
+    receiver.open()
     try:
-        assert receiver.next_sample(0.0) is None
-        started = time.monotonic()
-        assert receiver.next_sample(0.05) is None
-        assert time.monotonic() - started >= 0.03
-        sender.sendall(_frame(_payload(1)))
-        assert receiver.next_sample(0.0).frame.payload.sequence == 1
+        assert receiver.next_sample(0.02) is None
+        for session in (1, 2):
+            publisher = Publisher("127.0.0.1", port)
+            try:
+                ready(publisher, receiver, session=session)
+                publisher.send(_frame(1, session=session))
+                assert receiver.next_sample(1).frame.session == session
+            finally:
+                publisher.close()
     finally:
         receiver.close()
-        sender.close()
+    receiver.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        receiver.next_sample(0)
 
 
-def test_a_partial_frame_waits_for_the_rest():
-    receiver, sender = _tcp_receiver()
-    data = _frame(_payload(1))
+def test_slow_subscriber_does_not_block_publisher_or_other_subscriber():
+    with stream() as (publisher, slow, port):
+        fast = SampleReceiver(ReceiverConfig("127.0.0.1", port))
+        try:
+            fast.open()
+            ready(publisher, fast)
+            assert publisher._sock.getsockopt(zmq.SNDHWM) == 64
+            assert slow._sock.getsockopt(zmq.RCVHWM) == 64
+            started = time.monotonic()
+            received = []
+            # Never drain the slow subscriber. Continue servicing the other one.
+            for sequence in range(1, 10001):
+                assert publisher.send(_frame(sequence)) == 0
+                sample = fast.next_sample(0)
+                if sample is not None:
+                    received.append(sample.frame.sequence)
+            assert time.monotonic() - started < 5
+            assert received and received == sorted(set(received))
+            # Eventual delivery after the burst, without assuming which messages dropped.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                publisher.send(_frame(10001))
+                sample = fast.next_sample(0.01)
+                if sample is not None and sample.frame.sequence == 10001:
+                    break
+            else:
+                pytest.fail("Fast subscriber stopped receiving")
+        finally:
+            fast.close()
+
+
+def test_publisher_without_subscribers_and_bind_failure_release_resources():
+    port = _free_port()
+    publisher = Publisher("127.0.0.1", port)
     try:
-        sender.sendall(data[:40])
-        assert receiver.next_sample(0.05) is None
-        sender.sendall(data[40:])
-        sample = receiver.next_sample(1.0)
-        assert sample is not None and sample.frame.payload.sequence == 1
+        for sequence in range(100):
+            assert publisher.send(_frame(sequence)) == 0
+        with pytest.raises(zmq.ZMQError):
+            Publisher("127.0.0.1", port)
     finally:
-        receiver.close()
-        sender.close()
-
-
-def test_duplicates_and_old_sequences_are_dropped():
-    receiver, sender = _tcp_receiver()
-    try:
-        sender.sendall(_frame(*(_payload(s) for s in (1, 3, 2, 3, 4))))
-        assert _sequences(receiver) == [1, 3, 4]
-    finally:
-        receiver.close()
-        sender.close()
-
-
-def test_a_new_session_restarts_the_sequence_filter():
-    receiver, sender = _tcp_receiver()
-    try:
-        sender.sendall(
-            _frame(
-                _payload(1),
-                _payload(2),
-                _payload(1, session=2),
-                _payload(3),
-            )
-        )
-        samples = []
-        while (sample := receiver.next_sample(0.05)) is not None:
-            payload = sample.frame.payload
-            samples.append((payload.session, payload.sequence))
-        # The first session's later sequence is left behind, not replayed.
-        assert samples == [(1, 1), (1, 2), (2, 1)]
-    finally:
-        receiver.close()
-        sender.close()
-
-
-def test_a_good_frame_before_a_bad_header_is_delivered():
-    """One read may hold a good frame and then lose the stream boundary."""
-    receiver, sender = _tcp_receiver()
-    try:
-        sender.sendall(_frame(_payload(1)) + HEADER.pack(b"FAIL", MessageType.DATA, 97))
-        sample = receiver.next_sample(1.0)
-        assert sample is not None and sample.frame.payload.sequence == 1
-        with pytest.raises(FrameError):
-            receiver.next_sample(1.0)
-        # The stream is gone; the caller has to connect again.
-        with pytest.raises(RuntimeError, match="connect again"):
-            receiver.next_sample(1.0)
-    finally:
-        receiver.close()
-        sender.close()
-
-
-def test_a_closed_peer_is_a_connection_error():
-    receiver, sender = _tcp_receiver()
-    try:
-        sender.close()
-        with pytest.raises(ConnectionError, match="closed the sample stream"):
-            receiver.next_sample(1.0)
-    finally:
-        receiver.close()
-
-
-def test_udp_drops_bad_datagrams_without_losing_the_stream():
-    receiver, sender, port = _udp_receiver()
-    good = _frame(_payload(1))
-    try:
-        for data in (
-            b"broken",
-            HEADER.pack(b"MXEY", MessageType.CMD, 0),
-            good[:-1],
-            good + b"extra",
-        ):
-            sender.sendto(data, ("127.0.0.1", port))
-        sender.sendto(good, ("127.0.0.1", port))
-        sample = receiver.next_sample(1.0)
-        assert sample is not None and sample.frame.payload == _payload(1)
-    finally:
-        receiver.close()
-        sender.close()
+        publisher.close()
+    replacement = Publisher("127.0.0.1", port)
+    replacement.close()

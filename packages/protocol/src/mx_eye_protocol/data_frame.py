@@ -1,20 +1,11 @@
-"""Tracking payload and shared message frame models."""
+"""Tracking frame model and shared binary layout."""
 
 import math
 import struct
-from dataclasses import dataclass
-from enum import IntEnum, IntFlag, auto
+from enum import IntFlag, auto
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
-
-
-class MessageType(IntEnum):
-    """Message kinds in the shared frame header; CMD is reserved for control."""
-
-    # Member order is part of the binary wire contract.
-    DATA = auto()
-    CMD = auto()
 
 
 class TrackingFlags(IntFlag):
@@ -34,8 +25,7 @@ class TrackingFlags(IntFlag):
 
 # Tracking wire order: every payload field with its struct code, in byte order.
 # The struct format, its size and the decode field list all derive from this one
-# declaration, so the codec cannot disagree with itself. Little endian, like
-# HEADER: seven uint64, signed media time, eight float32, uint8 flags.
+# declaration, so the codec cannot disagree with itself. Little endian: seven uint64, signed media time, eight float32, uint8 flags.
 _TRACKING_LAYOUT: tuple[tuple[str, str], ...] = (
     ("session", "Q"),
     ("sequence", "Q"),
@@ -62,7 +52,7 @@ TRACKING_FIELDS: tuple[str, ...] = tuple(name for name, _ in _TRACKING_LAYOUT)
 _TRACKING_FORMAT = "<" + "".join(code for _, code in _TRACKING_LAYOUT)
 
 
-class TrackingPayload(BaseModel):
+class DataFrame(BaseModel):
     """One tracking sample, independent of its serialized representation.
 
     Timestamps except media_ns are nanoseconds from the shared wall clock
@@ -75,7 +65,7 @@ class TrackingPayload(BaseModel):
     example the raw flags byte becomes a TrackingFlags member.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     session: int  # Random 64-bit ID generated when a tracking session starts.
     sequence: int  # 1-based tracking-sample counter within the session.
@@ -128,43 +118,12 @@ class TrackingPayload(BaseModel):
     def queue_ms(self) -> float:
         return (self.tracking_start_ns - self.acquisition_ns) / 1e6
 
-
-@dataclass(frozen=True, kw_only=True)
-class DataFrame:
-    """A message envelope; length counts encoded payload bytes, not the header.
-
-    Only DATA payloads are implemented. Control messages will reuse this
-    envelope when their codec is introduced.
-    """
-
-    magic: bytes = b"MXEY"  # Four-byte marker identifying the frame protocol.
-    message_type: MessageType  # DATA for tracking; CMD reserved for control.
-    length: int  # Encoded payload byte count, excluding the header.
-    payload: TrackingPayload  # Typed payload before binary serialization.
-
-    # Little endian: magic, uint8 message type, uint32 encoded payload length.
-    HEADER: ClassVar[struct.Struct] = struct.Struct("<4sBI")
     TRACKING: ClassVar[struct.Struct] = struct.Struct(_TRACKING_FORMAT)
-    header_size: ClassVar[int] = HEADER.size
-
-    @classmethod
-    def from_payload(cls, payload: TrackingPayload) -> "DataFrame":
-        """Create a DATA frame with the binary payload's encoded byte length."""
-        return cls(
-            message_type=MessageType.DATA,
-            length=cls.TRACKING.size,
-            payload=payload,
-        )
 
     def encode(self) -> bytes:
-        """Serialize the frame fields without receiver-side protocol validation."""
-        header = self.HEADER.pack(self.magic, self.message_type, self.length)
-        body = self.TRACKING.pack(
-            *(getattr(self.payload, name) for name in TRACKING_FIELDS)
-        )
-        return header + body
+        """Serialize this frame; ZeroMQ supplies message boundaries."""
+        return self.TRACKING.pack(*(getattr(self, name) for name in TRACKING_FIELDS))
 
     @property
     def frame_size(self) -> int:
-        """Total frame byte count: header plus declared payload length."""
-        return self.header_size + self.length
+        return self.TRACKING.size

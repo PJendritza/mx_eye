@@ -1,54 +1,62 @@
-"""Control-plane access to the tracker command endpoint.
+"""Synchronous REQ/REP control access, with one REQ socket per call."""
 
-One request/response per connection on the tracker command port; the endpoint
-serves status, start and stop. Timing arithmetic is left to the data plane.
-"""
+import math
+import time
 
-import socket
-from collections.abc import Callable
-
-from mx_eye_protocol.control import Command, Reply, Request, StatusSnapshot
-from mx_eye_protocol.json_io import receive_json, send_json
-
-Connector = Callable[[tuple[str, int], float], socket.socket]
+import zmq
+from mx_eye_protocol.control import (
+    Command,
+    ControlReply,
+    ControlRequest,
+    StatusSnapshot,
+)
 
 
 class ControlClient:
-    """One request per connection against the tracker command endpoint."""
+    """Independent calls own their sockets, including on different GUI threads."""
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        timeout: float,
-        *,
-        connect: Connector = socket.create_connection,
-    ) -> None:
+    def __init__(self, host: str, port: int, timeout: float) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self._connect = connect
 
-    def rpc(self, request: Request, timeout: float | None = None) -> Reply:
-        """Send one typed request and return its validated reply."""
+    def rpc(
+        self, request: ControlRequest, timeout: float | None = None
+    ) -> ControlReply:
+        """Send once and wait for a reply. A timeout does not cancel execution."""
         timeout = self.timeout if timeout is None else timeout
-        try:
-            with self._connect((self.host, self.port), timeout) as sock:
-                sock.settimeout(timeout)
-                send_json(sock, request)
-                reply = receive_json(sock, Reply)
-                if not reply.ok:
-                    raise RuntimeError(reply.error or "Tracker rejected command")
-                return reply
-        except (TimeoutError, ConnectionError, OSError) as exc:
-            raise TimeoutError(
-                f"Tracker did not reply at {self.host}:{self.port}: {exc}"
-            ) from exc
+        data = request.model_dump_json(exclude_none=True).encode("utf-8")
+        deadline = time.monotonic() + timeout
+        with zmq.Context() as context, context.socket(zmq.REQ) as sock:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.IMMEDIATE, 1)
+            sock.connect(f"tcp://{self.host}:{self.port}")
+            try:
+                if not sock.poll(self._remaining_ms(deadline), zmq.POLLOUT):
+                    raise TimeoutError("Connection timed out")
+                sock.send(data, flags=zmq.NOBLOCK)
+                if not sock.poll(self._remaining_ms(deadline), zmq.POLLIN):
+                    raise TimeoutError("Reply timed out")
+                parts = sock.recv_multipart()
+            except (TimeoutError, zmq.ZMQError) as exc:
+                raise TimeoutError(
+                    f"Tracker did not reply at {self.host}:{self.port}: {exc}"
+                ) from exc
+        if len(parts) != 1:
+            raise ValueError("Expected one control reply frame")
+        reply = ControlReply.model_validate_json(parts[0])
+        if not reply.ok:
+            raise RuntimeError(reply.error or "Tracker rejected command")
+        return reply
+
+    @staticmethod
+    def _remaining_ms(deadline: float) -> int:
+        return max(0, math.ceil((deadline - time.monotonic()) * 1000))
 
     def request_status(
         self, command: Command, timeout: float | None = None
     ) -> StatusSnapshot:
-        reply = self.rpc(Request(command=command), timeout=timeout)
+        reply = self.rpc(ControlRequest(command=command), timeout=timeout)
         if reply.status is None:
             raise ValueError("Expected a status response")
         return reply.status

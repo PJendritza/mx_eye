@@ -46,11 +46,10 @@ while acquisition, tracking, network output and recording continue. Settings
 can import the previous desktop app's version 1 JSON configuration; the old
 `sync_port` setting is retired because clocks now synchronize through the OS.
 
-Click **Start** in the tracker, then **Connect** in the client: the SDK's
-data port exists only while a session is publishing, so connecting first reports
-a refused connection. The client's **Start tracker** and **Stop tracker**
-buttons control the same session over the control port; START is idempotent when
-a session is already running.
+Click **Connect** in the client before or after starting the tracker. The SDK
+subscribes asynchronously and reconnects when publication resumes. The client's
+**Start tracker** and **Stop tracker** buttons use ZeroMQ REQ/REP; samples use
+PUB/SUB. START is idempotent when a session is already running.
 
 ## Clock synchronization
 
@@ -68,9 +67,10 @@ More detail in AGENTS.md.
 
 ## SDK
 
-The SDK is the `py-mx-eye` package; `uv sync --all-extras` installs it. It owns
-no thread: every call runs on the caller's thread, so a consumer that has a
-thread of its own stays in control of it.
+The SDK is the `py-mx-eye` package; `uv sync --all-extras` installs it. It creates
+no Python background receiver thread: calls run on the caller's thread, while
+libzmq uses internal I/O threads. Open, read and close a sample stream on the
+same thread; control calls use independent REQ sockets.
 
 ```python
 from py_mx_eye import MxEye, MxEyeConfig
@@ -78,13 +78,12 @@ from py_mx_eye import MxEye, MxEyeConfig
 # The with block opens the sample stream and always releases it again.
 with MxEye(MxEyeConfig(host="127.0.0.1")) as eye:
     for sample in eye.read():  # wait on this thread for each sample
-        x, y = sample.frame.payload.x, sample.frame.payload.y
+        x, y = sample.frame.x, sample.frame.y
 ```
 
 `MxEyeConfig` is a frozen dataclass holding the connection parameters, so the
 constructor itself stays one argument long. `with` scopes only the sample
-stream, which `connect()` opens (the data port exists only while a session runs)
-and `close()` releases; acquisition stays explicit through `start()`/`stop()`,
+stream, which `connect()` subscribes to asynchronously and `close()` releases; acquisition stays explicit through `start()`/`stop()`,
 so leaving the block never stops the tracker.
 
 `read()` yields only samples that are still current measurements: lost, stale
@@ -95,10 +94,22 @@ ends the loop after that much silence, and the default waits indefinitely. Pass
 `max_age_ms=None, require_valid=False` to yield whatever arrives next, for
 plotting or diagnostics.
 
-Errors are exceptions rather than silent state: `connect()` raises when the
-tracker is not publishing, a closed or broken stream raises `ConnectionError`
-(connect again to resume), and a malformed frame raises `ValueError`. Coordinates
-are uncalibrated source-image pixels. A runnable example:
+`connect()` does not prove the publisher is online; use `read(timeout=...)`
+to bound a data wait. Subscription setup and reconnection can lose initial
+samples. Queues are bounded to 64 messages per peer on each end; slow consumers
+can lose samples without blocking tracking. Malformed data messages are dropped.
+
+The tracker binds PUB on port 5556 and REP on port 5557 by default. Both use TCP.
+Each sample is one 97-byte binary message, without an application header. Each
+control request/reply is one UTF-8 JSON message. Commands are processed serially:
+start/stop wait for their operation result, so other requests queue during startup.
+Stop may return `stopping`; query status for completion. Control timeouts raise
+`TimeoutError`, do not cancel server execution, and are never automatically retried.
+
+Update tracker and SDK together. Raw TCP/UDP, the old frame header, and the
+`transport`, `udp_host`, and `udp_bind` settings have been removed; remove these
+keys from saved configurations. Host/bind and the two port settings remain.
+Coordinates are uncalibrated source-image pixels. A runnable example:
 `uv run python -m mx_eye_client.receive_minimal`. More detail in AGENTS.md.
 
 ### GUI controls

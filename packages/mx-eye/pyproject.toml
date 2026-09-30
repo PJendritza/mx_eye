@@ -4,6 +4,7 @@ version = '0.1.0'
 description = 'MXBI pupil and corneal reflection tracker'
 requires-python = '>=3.11'
 dependencies = [
+    "pyzmq>=27,<28",
     "mx-eye-protocol",
     "pydantic>=2,<3",
 ]

@@ -8,7 +8,6 @@ import os
 import queue
 import shutil
 import signal
-import socket
 import time
 from pathlib import Path
 
@@ -18,7 +17,6 @@ import psutil
 from mx_eye_protocol.data_frame import (
     DataFrame,
     TrackingFlags,
-    TrackingPayload,
 )
 
 from .config import (
@@ -26,7 +24,6 @@ from .config import (
     RecordingCodec,
     SourceMode,
     TrackingMode,
-    Transport,
 )
 from .recording import TRACKING_COLUMNS, tracking_row
 from .recording import MjpegCopyWriter
@@ -478,7 +475,7 @@ def tracking_worker(
     if config.value.template:
         restore_template(core, config.value.template)
     net = config.value.network
-    pub, udp = None, None
+    pub = None
     frame_id = seq = 0
     revision = 0
     last_preview = 0
@@ -486,12 +483,7 @@ def tracking_worker(
     current = None
     last_media = -1
     try:
-        if net.transport is Transport.TCP:
-            pub = Publisher(net.bind, net.data_port)
-        else:
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp.setblocking(False)
-            destination = (str(net.udp_host), net.data_port)
+        pub = Publisher(net.bind, net.data_port)
         report(events, "tracking_ready")
         while True:
             generation = recording_generation.value if recording_generation is not None else 0
@@ -590,7 +582,7 @@ def tracking_worker(
                 if config.value.source.mode is SourceMode.SIMULATION:
                     flags |= TrackingFlags.SIMULATION
                 send = time.time_ns()
-                payload = TrackingPayload(
+                payload = DataFrame(
                     session=session,
                     sequence=seq,
                     frame=frame_id,
@@ -609,14 +601,8 @@ def tracking_worker(
                     template_ncc=result["template_score"],
                     flags=flags,
                 )
-                data = DataFrame.from_payload(payload).encode()
-                try:
-                    if pub is not None:
-                        stats["send_errors"].value += pub.send(data)
-                    else:
-                        udp.sendto(data, destination)
-                except (BlockingIOError, OSError):
-                    stats["send_errors"].value += 1
+                data = payload.encode()
+                stats["send_errors"].value += pub.send(data)
                 if samples is not None and (recording is None or recording.is_set()):
                     try:
                         samples.put_nowait(payload)
@@ -664,8 +650,6 @@ def tracking_worker(
     finally:
         if pub is not None:
             pub.close()
-        if udp is not None:
-            udp.close()
         # Ensure the feeder flushes sample rows before declaring tracking done.
         if samples is not None:
             if (recording_generation is not None

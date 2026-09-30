@@ -4,7 +4,6 @@ import csv
 import io
 import math
 import multiprocessing
-import struct
 from dataclasses import replace
 
 import pytest
@@ -12,19 +11,14 @@ from mx_eye.recording import TRACKING_COLUMNS, tracking_row
 from mx_eye_protocol import (
     TRACKING_FIELDS,
     DataFrame,
-    MessageType,
     TrackingFlags,
-    TrackingPayload,
 )
 from py_mx_eye import Sample
-from py_mx_eye.receiver import decode_frame, decode_header
+from py_mx_eye.receiver import decode_frame
 
-HEADER = struct.Struct("<4sBI")
-
-# Header: MXEY, DATA=1, length=97. Payload: seven uint64, signed -1,
+# Payload: seven uint64, signed -1,
 # eight float32 values and flags=63. Independent of the implementation's Structs.
 FRAME_BYTES = bytes.fromhex(
-    "4d5845590161000000"
     "0100000000000000"
     "0200000000000000"
     "0300000000000000"
@@ -39,7 +33,7 @@ FRAME_BYTES = bytes.fromhex(
 
 @pytest.fixture
 def payload():
-    return TrackingPayload(
+    return DataFrame(
         session=1,
         sequence=2,
         frame=3,
@@ -61,20 +55,19 @@ def payload():
 
 
 def test_fixed_bytes(payload):
-    assert len(FRAME_BYTES) == 106
-    outgoing = DataFrame.from_payload(payload)
-    assert outgoing.payload is payload
+    assert len(FRAME_BYTES) == 97
+    outgoing = payload
     assert outgoing.encode() == FRAME_BYTES
     frame = decode_frame(FRAME_BYTES)
     assert frame == outgoing
     assert frame.encode() == FRAME_BYTES
-    assert frame == DataFrame(message_type=MessageType.DATA, length=97, payload=payload)
+    assert frame == payload
     assert outgoing.frame_size == len(FRAME_BYTES)
 
 
 def test_wire_field_order_is_declared_once():
     """Model order, decode field list and struct arity share one declaration."""
-    assert TRACKING_FIELDS == tuple(TrackingPayload.model_fields)
+    assert TRACKING_FIELDS == tuple(DataFrame.model_fields)
     assert DataFrame.TRACKING.size == 97
     # The strict zip in decode_frame relies on these two counts agreeing.
     assert len(DataFrame.TRACKING.unpack(bytes(DataFrame.TRACKING.size))) == len(
@@ -83,7 +76,6 @@ def test_wire_field_order_is_declared_once():
 
 
 def test_auto_enum_wire_values():
-    assert (int(MessageType.DATA), int(MessageType.CMD)) == (1, 2)
     assert (
         int(TrackingFlags.NONE),
         int(TrackingFlags.VALID),
@@ -102,13 +94,6 @@ def test_auto_enum_wire_values():
         FRAME_BYTES[:8],
         FRAME_BYTES[:-1],
         FRAME_BYTES + b"\x00",
-        b"FAIL" + FRAME_BYTES[4:],
-        FRAME_BYTES[:4] + b"\x00" + FRAME_BYTES[5:],
-        FRAME_BYTES[:4] + b"\xff" + FRAME_BYTES[5:],
-        FRAME_BYTES[:5] + bytes.fromhex("00000000") + FRAME_BYTES[9:],
-        FRAME_BYTES[:5] + bytes.fromhex("60000000") + FRAME_BYTES[9:],
-        FRAME_BYTES[:5] + bytes.fromhex("62000000") + FRAME_BYTES[9:],
-        FRAME_BYTES[:5] + bytes.fromhex("ffffffff") + FRAME_BYTES[9:],
     ],
 )
 def test_malformed_frame(data):
@@ -116,45 +101,12 @@ def test_malformed_frame(data):
         decode_frame(data)
 
 
-@pytest.mark.parametrize(
-    "header",
-    [
-        b"",
-        FRAME_BYTES[:8],
-        FRAME_BYTES[:10],
-        b"FAIL" + FRAME_BYTES[4:9],
-        FRAME_BYTES[:4] + b"\xff" + FRAME_BYTES[5:9],
-        FRAME_BYTES[:5] + bytes.fromhex("ffffffff"),
-    ],
-)
-def test_invalid_headers_rejected_before_body(header):
-    with pytest.raises(ValueError):
-        decode_header(header)
-
-
-def test_cmd_reserved():
-    header = HEADER.pack(b"MXEY", MessageType.CMD, 0)
-    with pytest.raises(ValueError, match="CMD payloads are not implemented"):
-        decode_header(header)
-    with pytest.raises(ValueError, match="CMD payloads are not implemented"):
-        decode_frame(header)
-
-
-def test_old_v1_frame_rejected():
-    legacy = bytes.fromhex("4d584559013f0000") + FRAME_BYTES[9:-1]
-    assert len(legacy) == 104
-    with pytest.raises(ValueError):
-        decode_frame(legacy)
-
-
 def test_float32_and_missing_values(payload):
     decoded = decode_frame(
-        DataFrame.from_payload(
-            payload.model_copy(
-                update={"x": 0.1, "cr_x": math.nan, "flags": TrackingFlags.VALID}
-            )
+        payload.model_copy(
+            update={"x": 0.1, "cr_x": math.nan, "flags": TrackingFlags.VALID}
         ).encode()
-    ).payload
+    )
     assert decoded.x == 0.10000000149011612
     assert math.isnan(decoded.cr_x)
     assert decoded.flags is TrackingFlags.VALID
@@ -195,13 +147,13 @@ def _timed_sample(payload):
     payload = payload.model_copy(
         update={"acquisition_ns": 2_000_000, "send_ns": 5_000_000}
     )
-    frame = DataFrame(message_type=MessageType.DATA, length=97, payload=payload)
+    frame = payload
     return Sample(frame=frame, receive_ns=7_000_000)
 
 
 def test_sample_timing(payload):
     sample = _timed_sample(payload)
-    assert sample.frame.payload.send_ns == 5_000_000
+    assert sample.frame.send_ns == 5_000_000
     # Delay compares the frame timestamps with receiver time directly.
     assert sample.network_ms == 2
     assert sample.arrival_age_ms == 5
@@ -221,12 +173,7 @@ def test_sample_freshness(payload):
     assert sample.is_fresh_at(20_000_001, max_age_ms=None)
     lost = replace(
         sample,
-        frame=replace(
-            sample.frame,
-            payload=sample.frame.payload.model_copy(
-                update={"flags": TrackingFlags.NONE}
-            ),
-        ),
+        frame=sample.frame.model_copy(update={"flags": TrackingFlags.NONE}),
     )
     assert not lost.is_fresh_at(10_000_000, max_age_ms=10)
     assert lost.is_fresh_at(10_000_000, max_age_ms=10, require_valid=False)

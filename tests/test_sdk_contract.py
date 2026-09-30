@@ -5,7 +5,6 @@ import importlib
 import inspect
 
 import pytest
-from mx_eye_protocol.control import Transport
 from py_mx_eye import MxEye, MxEyeConfig, Sample
 
 EYE_METHODS = (
@@ -21,8 +20,6 @@ CONFIG_FIELDS = (
     "host",
     "data_port",
     "control_port",
-    "transport",
-    "udp_bind",
     "timeout",
 )
 
@@ -44,18 +41,11 @@ def test_defaults_are_reachable_without_a_config():
     assert eye.config.data_port == 5556
     assert eye.config.control_port == 5557
     assert eye.config.timeout == 3.0
-    assert eye.config.transport is Transport.TCP
-
-
-def test_transport_is_always_an_explicit_enum():
-    """The handle never infers the transport; there is no None and no string."""
-    assert MxEyeConfig().transport is Transport.TCP
-    assert MxEyeConfig(transport=Transport.UDP).transport is Transport.UDP
 
 
 def test_the_handle_keeps_the_config_it_was_given():
     """No copying and no rewriting: the config stays the single source."""
-    config = MxEyeConfig(host="10.0.0.2", transport=Transport.UDP)
+    config = MxEyeConfig(host="10.0.0.2")
     assert MxEye(config).config is config
 
 

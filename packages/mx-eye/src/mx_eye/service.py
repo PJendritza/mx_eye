@@ -15,9 +15,9 @@ import cv2
 import numpy as np
 from mx_eye_protocol.control import (
     Command,
+    ControlReply,
+    ControlRequest,
     NetworkStatus,
-    Reply,
-    Request,
     SourceStatus,
     StatusSnapshot,
     TrackingStats,
@@ -74,7 +74,6 @@ class Service:
         self.priority_info = []
         self._server_errors = []
         self._server = None
-        self._server_thread = None
         self._owner = threading.Thread(
             target=self._supervise, daemon=True, name="mx-eye supervisor"
         )
@@ -83,30 +82,21 @@ class Service:
 
     def _start_server(self):
         net = self.config.value.network
+        server = ControlServer(
+            (str(net.bind), net.control_port), self._dispatch_request
+        )
         try:
-            self._server = ControlServer(
-                (str(net.bind), net.control_port), self._dispatch_request
-            )
-        except OSError as exc:
+            server.start()
+        except Exception as exc:  # noqa: BLE001 - surface control worker startup failure
             self._server_errors.append(f"control server: {exc}")
             self.message = "; ".join(self._server_errors)
             return
-        self._server_thread = threading.Thread(
-            target=self._server.serve_forever,
-            kwargs={"poll_interval": 0.1},
-            daemon=True,
-            name="mx-eye control",
-        )
-        self._server_thread.start()
+        self._server = server
 
     def _stop_server(self):
         if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
+            self._server.close()
             self._server = None
-        if self._server_thread is not None:
-            self._server_thread.join(1)
-            self._server_thread = None
 
     def submit(self, command, **args):
         future = concurrent.futures.Future()
@@ -126,7 +116,9 @@ class Service:
                 message=self.message,
                 paused=bool(run and run["paused"].is_set()),
                 session=self.session,
-                stats=TrackingStats.model_validate({k: v for k, v in stats.items() if k in TrackingStats.model_fields}),
+                stats=TrackingStats.model_validate(
+                    {k: v for k, v in stats.items() if k in TrackingStats.model_fields}
+                ),
                 directory=self.directory,
                 network=NetworkStatus.model_validate(
                     self.config.value.network, from_attributes=True
@@ -178,10 +170,10 @@ class Service:
                             item["result"]["template_center"]
                         )
 
-    def _dispatch_request(self, request: Request) -> Reply:
+    def _dispatch_request(self, request: ControlRequest) -> ControlReply:
         if request.command is Command.STATUS:
-            return Reply(status=self.snapshot())
-        return Reply(status=self.submit(request.command).result(timeout=15))
+            return ControlReply(status=self.snapshot())
+        return ControlReply(status=self.submit(request.command).result(timeout=15))
 
     def _start(self):
         if self.run:
@@ -229,7 +221,13 @@ class Service:
             tracked_frame=c.Value("q", 0),
             mailbox=Mailbox(c, max_bytes),
             samples=c.Queue(4096) if recordable else None,
-            ring=FrameRing(c, max_bytes, max(2, int(config.value.recording.buffer_mb * 1024**2 / max_bytes))) if recordable else None,
+            ring=FrameRing(
+                c,
+                max_bytes,
+                max(2, int(config.value.recording.buffer_mb * 1024**2 / max_bytes)),
+            )
+            if recordable
+            else None,
             recording=c.Event(),
             recording_generation=c.Value("q", 0),
             recording_stop=c.Event(),
@@ -341,7 +339,9 @@ class Service:
         previous = run["processes"].get("writer")
         if previous is not None:
             if not run["writer_done"].is_set() or previous.is_alive():
-                raise RuntimeError("Wait for the previous recording to finish draining.")
+                raise RuntimeError(
+                    "Wait for the previous recording to finish draining."
+                )
             previous.join()
         if run["stats"]["record_fault"].value:
             raise RuntimeError("Restart tracking after resolving the recording fault.")
@@ -352,15 +352,29 @@ class Service:
         run["ready"].discard("writer_ready")
         config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.directory = str(Path(config.value.recording.directory).expanduser().resolve()
-                             / f"{stamp}_{self.session:016x}")
+        self.directory = str(
+            Path(config.value.recording.directory).expanduser().resolve()
+            / f"{stamp}_{self.session:016x}"
+        )
         writer = self.ctx.Process(
-            target=writer_worker, name="mx-eye recording",
-            args=(config, self.session, self.directory, run["ring"], run["samples"],
-                  run["capture_done"], run["tracking_done"], run["writer_done"],
-                  run["stats"], run["events"]),
-            kwargs={"recording_capture_done": run["recording_capture_done"],
-                    "recording_generation": run["recording_generation"].value + 1},
+            target=writer_worker,
+            name="mx-eye recording",
+            args=(
+                config,
+                self.session,
+                self.directory,
+                run["ring"],
+                run["samples"],
+                run["capture_done"],
+                run["tracking_done"],
+                run["writer_done"],
+                run["stats"],
+                run["events"],
+            ),
+            kwargs={
+                "recording_capture_done": run["recording_capture_done"],
+                "recording_generation": run["recording_generation"].value + 1,
+            },
         )
         run["recording_generation"].value += 1
         try:
@@ -370,9 +384,13 @@ class Service:
             while "writer_ready" not in run["ready"]:
                 self._events()
                 if run["stats"]["record_fault"].value or writer.exitcode is not None:
-                    raise RuntimeError(self.message or "Recording could not initialize.")
+                    raise RuntimeError(
+                        self.message or "Recording could not initialize."
+                    )
                 if time.monotonic() > deadline:
-                    raise TimeoutError("Recording did not initialize within 10 seconds.")
+                    raise TimeoutError(
+                        "Recording did not initialize within 10 seconds."
+                    )
                 time.sleep(0.01)
         except Exception:
             run["recording_stop"].set()
@@ -406,8 +424,9 @@ class Service:
                 elif kind == "template":
                     self.config.value.template = e["template"]
                 elif kind in ("source", "dimensions"):
-                    self.source_info.update({k: v for k, v in e.items()
-                                             if k in SourceStatus.model_fields})
+                    self.source_info.update(
+                        {k: v for k, v in e.items() if k in SourceStatus.model_fields}
+                    )
                     if "camera_controls" in e:
                         self.camera_control_info = e["camera_controls"]
                     if "recording_path" in e:

@@ -19,7 +19,6 @@ from .config import (
     TrackingConfig,
     TrackingMode,
     TrackingParameters,
-    Transport,
     configure,
     store,
 )
@@ -43,7 +42,6 @@ __all__ = [
     "TrackingConfig",
     "TrackingMode",
     "TrackingParameters",
-    "Transport",
     "configure",
     "store",
 ]

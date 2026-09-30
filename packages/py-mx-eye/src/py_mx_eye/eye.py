@@ -1,7 +1,7 @@
 """Public SDK handle: one synchronous connection to one tracker.
 
-No Qt or OpenCV dependency, and no thread of its own: every call runs on the
-caller's thread, so a consumer that owns a thread stays in control of it.
+No Qt or OpenCV dependency or Python background receiver thread. Calls run on
+the caller's thread; libzmq manages transport I/O internally.
 
 - ``with MxEye(...)`` scopes the sample stream: ``connect()`` on entry,
   ``close()`` on exit.
@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Self
 
-from mx_eye_protocol.control import Command, StatusSnapshot, Transport
+from mx_eye_protocol.control import Command, StatusSnapshot
 
 from .control import ControlClient
 from .receiver import ReceiverConfig, SampleReceiver
@@ -28,18 +28,12 @@ from .sample import Sample
 class MxEyeConfig:
     """How to reach one tracker.
 
-    This is the constructor parameter object, not the tracker's own JSON
-    configuration document. ``transport`` is the enum the tracker publishes on
-    (default TCP); it is stated here rather than inferred from the tracker, so it
-    must match that tracker's own setting. ``timeout`` bounds the socket connect
-    and the control requests.
+    ``timeout`` bounds control requests; data reads have their own timeout.
     """
 
     host: str = "127.0.0.1"
     data_port: int = 5556
     control_port: int = 5557
-    transport: Transport = Transport.TCP
-    udp_bind: str = "0.0.0.0"
     timeout: float = 3.0
 
 
@@ -56,18 +50,12 @@ class MxEye:
             ReceiverConfig(
                 host=self.config.host,
                 port=self.config.data_port,
-                udp_bind=self.config.udp_bind,
             )
         )
 
     def connect(self) -> Self:
-        """Open the sample stream, raising when the tracker is not publishing.
-
-        The tracker's data port exists only while a tracking session runs, so
-        connect after starting one (`start()`, or the tracker's own Start).
-        Nothing is retried here; a caller that wants to wait reconnects.
-        """
-        self._receiver.open(self.config.transport, self.config.timeout)
+        """Subscribe asynchronously; the tracker may start or restart later."""
+        self._receiver.open()
         self._connected = True
         return self
 

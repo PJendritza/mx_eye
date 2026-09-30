@@ -24,7 +24,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
   transmitted and recorded X/Y. Pupil + CR remains pupil minus CR. A moving ROI
   changes the relative origin; this is not calibrated gaze or full head-motion
   compensation. Raw pupil_x/pupil_y remain absolute. The SDK exposes
-  `sample.frame.payload.coordinate_system`; packet/CSV flag bit 32 marks ROI-relative output.
+  `sample.frame.coordinate_system`; packet/CSV flag bit 32 marks ROI-relative output.
 - **Video navigation:** Left/Right arrows pause and step one frame backward/forward.
   Parameter editors keep their normal arrow-key behavior. Click anywhere on the
   timeline to seek immediately, or drag and release. Play/Pause changes its label
@@ -167,13 +167,12 @@ the camera or USB driver. `tracking_log_complete` separately reports log overflo
 
 The public handle is `MxEye`; `MxEye`, `MxEyeConfig` and `Sample` are exported
 from `py_mx_eye`. The constructor takes one parameter object, the frozen
-`MxEyeConfig` dataclass (host, both ports, transport, UDP bind address and
-timeout), and `SampleReceiver` takes `ReceiverConfig` the same way: a constructor
+`MxEyeConfig` dataclass (host, both ports and timeout), and `SampleReceiver` takes `ReceiverConfig` the same way: a constructor
 never carries a long parameter list.
 
-The SDK is **fully synchronous and owns no thread**: every call runs on the
-caller's thread, so a consumer that has a thread of its own keeps control of it
-and never ends up with threads nested inside the SDK. `read(timeout, max_age_ms,
+The SDK is **fully synchronous and creates no Python receiver thread**: calls
+run on the caller's thread; libzmq manages internal I/O threads. Open, read and
+close a sample stream on the same thread. Control calls own independent sockets. `read(timeout, max_age_ms,
 require_valid)` is the only data access, and it is an iterator:
 `for sample in eye.read():` waits on the caller's thread for each sample.
 `with MxEye(...)` scopes the sample stream: `connect()` on entry, `close()` on
@@ -191,19 +190,15 @@ ends when a wait expires: `read(0)` drains what has arrived without blocking
 that much silence, and the default waits indefinitely. Never use the previous
 valid point as if it were a current measurement. `max_age_ms=None` skips the age
 check and `require_valid=False` skips the validity check; together they yield
-whatever arrives next, which is what plotting and diagnostics want. Nothing is buffered beyond the
-frame currently arriving and the samples already parsed from the last received
-chunk, so there is no overwrite counter and no buffered backlog to fall behind.
-Errors are exceptions, not silent state: `connect()` raises when the tracker is
-not publishing, a closed or broken stream raises `ConnectionError` (the socket is
-released; connect again to resume), and a malformed TCP header raises
-`FrameError`/`ValueError`. Samples that repeat a sequence, arrive out of order, or
-belong to a session already left behind are dropped; a new session restarts
-sequence numbers and is followed rather than stalled on. Use `status()` to
-inspect tracker/recording state. `MxEyeConfig.transport` is an explicit
-`Transport` member (default TCP) that nothing infers, so it must match the
-tracker's own setting; the handle keeps the config it was given, and `timeout`
-bounds the socket connect and the control requests.
+whatever arrives next, which is what plotting and diagnostics want. ZeroMQ queues are bounded
+with SNDHWM=64 and RCVHWM=64, without conflation. Slow subscribers can lose
+samples; `send_errors` counts local send failures, not subscriber drops.
+`connect()` subscribes asynchronously even without a publisher; libzmq reconnects
+automatically. Subscription setup and reconnects may lose initial samples.
+Malformed data messages, repeated or out-of-order sequences, and samples from a
+session already left behind are dropped. A new session restarts sequence numbers.
+Use `status()` to inspect tracker state. `MxEyeConfig.timeout` bounds control
+requests; `read(timeout=...)` bounds data waits.
 
 Coordinates are **uncalibrated source-image pixels**, positive x rightward and y
 downward. They are not screen coordinates or visual degrees. Invalid signals use
@@ -217,88 +212,54 @@ from a checkout (`uv sync --all-extras`) or install the wheels built by `uv buil
 
 ## Networking
 
-Defaults are local-machine only:
+Defaults are local-machine only. Both channels use ZeroMQ over TCP:
 
-| Purpose | Transport | Port |
+| Purpose | Pattern | Port |
 |---|---|---:|
-| Tracking samples | TCP, optionally UDP | 5556 |
-| Start/stop/status commands | TCP | 5557 |
+| Tracking samples | Tracker PUB bind, SDK SUB connect | 5556 |
+| Start/stop/status commands | Tracker REP bind, SDK REQ connect | 5557 |
 
-For separate computers: set tracker bind address to `0.0.0.0`, use its LAN IP in
-`MxEyeConfig(host=...)` or `uv run mx-eye-receiver --host TRACKER_IP`, and allow the
-configured ports through the local firewall. With UDP, also set the receiver's
-LAN IP in tracker Settings. UDP has one target; TCP accepts up to eight receivers.
-The SDK does not read the transport from the status server: `MxEyeConfig`
-states it (default TCP) and it must match the tracker's setting. `connect()`
-opens the data socket and raises while the tracker is not publishing; because
-the tracking process creates its `Publisher` per session, the data port exists
-only between Start and Stop, so connect after starting a session. Nothing is
-retried: the caller decides whether to connect again.
-Both address fields are validated as IPv4 literals, so hostnames are rejected
-instead of being resolved at run time.
-Reconnect clients after changing transport/ports. The protocol is unauthenticated
-and intended for a trusted lab network, not an exposed internet service.
+For separate computers, set tracker bind to `0.0.0.0`, use its LAN IP in
+`MxEyeConfig(host=...)`, and allow the ports through the firewall. Tracker bind
+is validated as an IPv4 literal. The protocol is unauthenticated and intended
+for a trusted lab network. Recreate clients after changing endpoint addresses.
+There is no TCP/UDP selector or UDP destination/bind setting.
 
-Sample TCP uses length-prefixed binary framing, disables Nagle, and never waits for slow
-receivers: a partial/blocked send disconnects that receiver, which the SDK reports
-as `ConnectionError` so the caller can connect again.
-UDP can lose/reorder datagrams. Both include a session ID, sample sequence, and
-source-frame ID. The SDK drops out-of-order samples and anything from a session
-it already left behind, and follows a new session from its first sample. Neither
-mode guarantees delivery of every sample.
+Each sample is a single 97-byte `<7Qq8fB` ZeroMQ message: seven uint64 fields,
+signed media time, eight float32 fields, and a flags byte. No magic, message type,
+length prefix or multipart topic is added. SUB subscribes to all messages on this
+endpoint. Malformed lengths and multipart messages are dropped independently.
 
-The sample frame header is little-endian `<4sBI`: magic `MXEY`, message type
-(`DATA=1`, `CMD=2`), and uint32 encoded payload length (excluding the header).
-DATA carries a 97-byte `<7Qq8fB` TrackingPayload; the full frame is 106 bytes.
-It replaces the old 104-byte v1 protocol and is not compatible with the earlier
-`eye_sender_switchable_v4.py` experiment. Update tracker and SDK together.
-TCP validates the header before buffering the declared payload and disconnects
-on malformed headers; UDP drops malformed datagrams. Only DATA is implemented;
-The binary CMD type is reserved. All commands use newline-delimited
-JSON on the single control port. The TCP server handles concurrent connections,
-each with one request and one response followed by connection closure.
-Request, Reply and nested status fields are Pydantic models. Command, Transport
-and SourceMode use StrEnum with auto(); configuration reuses the same enums.
-The control protocol version is the SemVer string `1.0.0`; other versions,
-including legacy integers, are rejected. Packages require Python 3.11 or newer.
-Replies contain either a nested status or an error.
-SDK start/stop/status return StatusSnapshot with field access such as
-`status.network.transport` and `status.stats.tracked`.
-Remove legacy `sync_port` configuration/client arguments and `--sync-port`;
-old flat status responses are no longer supported. Update both endpoints together.
+`_TRACKING_LAYOUT` in `data_frame.py` declares wire order once; `TRACKING_FIELDS`
+and `DataFrame.TRACKING` derive from it. `DataFrame` is a frozen Pydantic
+model containing the tracking fields directly, with `encode()` and `frame_size`.
+The SDK decoder unpacks one complete message and validates it as a DataFrame.
+Access fields directly through `sample.frame.x`, `sample.frame.sequence`, etc.;
+there is no payload wrapper.
+Recording queues still carry full-precision DataFrame objects and map them
+to the unchanged CSV columns, without a float32 round trip.
 
-`packages/protocol/src/mx_eye_protocol/data_frame.py` declares the payload's
-wire order exactly once, as `_TRACKING_LAYOUT` (field name plus struct code);
-`TRACKING_FIELDS` and `DataFrame.TRACKING` both derive from it, so the struct,
-its encoded size and the decode field list cannot disagree, and `encode()` packs
-that same list instead of repeating it. `TrackingPayload` is a frozen Pydantic
-model whose field order is the wire order and whose declared types decode a
-payload, so the flags byte becomes a `TrackingFlags` member with no conversion
-code in the codec; a decoder validates once with
-`model_validate(dict(zip(TRACKING_FIELDS, unpack(...), strict=True)))`.
-`DataFrame` stays a plain frozen dataclass envelope containing magic,
-message_type, length and payload, and owning the shared binary layout; it exposes
-`from_payload()`, `encode()` and the `frame_size` property. Encoding does not
-validate the header. `DataFrame.header_size` is the stream header length. The SDK
-implements decoding and incoming-header validation in `py_mx_eye/receiver.py`,
-where the caller's thread reads the header, then exactly the payload bytes the
-header declares.
-The SDK Sample contains the complete frame plus its reception time.
-Use `sample.frame.payload` to access tracking fields.
-Recording queues carry TrackingPayload objects; the recording layer maps them to
-the unchanged CSV columns without binary float32 conversion.
+Control uses one UTF-8 JSON frame per request and reply, without newline
+delimiters or binary headers. Endpoints use Pydantic JSON serialization and
+validation directly, with no application-level message size cap. ControlRequest/ControlReply and nested status
+remain Pydantic models with control protocol SemVer `1.0.0`. Command and
+SourceMode use lowercase StrEnum values. Successful replies contain `ok: true`
+and `status`; errors contain `ok: false` and `error`. For example, a request is
+`{"command":"status","protocol":"1.0.0"}`.
 
-TrackingPayload flags use TrackingFlags (IntFlag); combine members with `|`.
-`TrackingFlags.NONE` means no flags. The former Packet type and flat Sample
-sampling attributes have been removed. Use `sample.frame.length` for encoded
-payload size and `sample.age_ms` for reception timing.
-TCP reception handles split and coalesced frames, rejecting unknown message
-types, reserved CMD frames and invalid DATA lengths before their bodies are read.
-UDP uses the same binary envelope. Control JSON does not use that envelope.
-Enum values remain lowercase strings in JSON. Successful replies contain
-`ok: true` and a `status`; failures contain `ok: false` and `error`.
-For example, a status request is `{"command":"status","protocol":"1.0.0"}`
-followed by a newline.
+One worker thread owns the REP socket and handles commands serially. Start/stop
+wait for the existing operation result; other requests queue meanwhile and may
+time out. Stop can return `stopping`; status reports recording drain completion.
+Invalid requests and operation errors receive an error reply before the next
+request is accepted. Each SDK RPC owns a fresh REQ socket, including after a
+timeout, and never resends automatically. A timeout does not cancel execution;
+query status to resolve uncertainty. All sockets close with LINGER=0. The REP
+worker polls its shutdown event and closes its socket/context on its own thread.
+
+Raw TCP/UDP, MessageType, the old frame envelope and byte-stream assembler have
+been removed. Tracker and SDK must be updated together; remove `transport`,
+`udp_host`, and `udp_bind` from old configuration/client calls. No compatibility
+layer is provided.
 
 ## Type checking
 
@@ -396,8 +357,8 @@ A hardware-timestamped camera/backend would be needed to improve that boundary.
   detections, including loss and reacquisition. Template center arithmetic was
   corrected to use the pixel center consistently; display work was removed from
   the tracking path.
-- Transport design follows the earlier v4 TCP/UDP experiments; production code
-  uses standard sockets rather than ZeroMQ. The application-level clock-sync
+- Issue #4 migrates data to ZeroMQ PUB/SUB and control to REQ/REP.
+  The application-level clock-sync
   experiment was removed in favour of system-level NTP/PTP, so packet timestamps
   are compared against one shared system clock (issue #7).
 - No physical-camera or real-marmoset-video validation was possible in this session.

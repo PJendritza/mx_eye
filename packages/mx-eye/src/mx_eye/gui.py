@@ -21,14 +21,12 @@ from .config import (
     RecordingCodec,
     SourceMode,
     TrackingMode,
-    Transport,
 )
 from .helptext import TIPS, add_tooltips
 from .service import Service
 from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
-    ("network", "transport"): Transport,
     ("recording", "codec"): RecordingCodec,
 }
 
@@ -49,14 +47,8 @@ class Settings(W.QDialog):
                 "network",
                 [
                     ("bind", "Tracker bind address", None),
-                    (
-                        "transport",
-                        "Sample transport",
-                        [item.value for item in Transport],
-                    ),
                     ("data_port", "Sample port", 1024, 65535),
                     ("control_port", "Command port", 1024, 65535),
-                    ("udp_host", "UDP receiver address", None),
                 ],
             ),
             "Recording": (
@@ -82,7 +74,7 @@ class Settings(W.QDialog):
         }
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
-            "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. UDP sends to one configured receiver. Control is unauthenticated: use only your trusted local network.",
+            "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. Samples use ZeroMQ PUB/SUB; commands use REQ/REP. Control is unauthenticated: use only your trusted local network.",
             "Recording": "MJPG: fast, lossy AVI. FFV1: lossless MKV, higher CPU demand. Full source frames are saved without overlays. Buffer overflow stops recording and marks the session incomplete; tracking continues.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }

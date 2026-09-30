@@ -39,6 +39,7 @@ def test_mkv_preserves_irregular_timing_and_images(tmp_path, compressed):
         assert reader.read(3)[2] == 50_000_000
         assert reader.read(1)[2] == 8_000_000
         assert reader.read(4)[2] == 67_000_000
+        assert reader.median_fps == pytest.approx(1e9 / 14_000_000)
     finally:
         reader.close()
 
@@ -92,5 +93,6 @@ def test_video_worker_uses_timestamps_not_nominal_fps(tmp_path):
         assert state.stats.capture_fault == 0
         assert state.stats.tracking_fault == 0
         assert service.video_timing_info == "Acquisition timestamps"
+        assert service.video_median_fps == pytest.approx(10)
     finally:
         service.close()

@@ -1,6 +1,7 @@
 """Timestamped video decoding and exact frame navigation with a bounded cache."""
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from statistics import median
 import math
 
 import av
@@ -35,6 +36,7 @@ class VideoReader:
         self.decoder = iter(self.container.decode(self.stream))
         self.next_index = 0
         self.origin_ns = self.previous_ns = None
+        self.intervals = deque(maxlen=120)
 
     def read(self, target):
         target = max(0, int(target))
@@ -72,6 +74,8 @@ class VideoReader:
                 raise ValueError("Video has neither frame timestamps nor a valid frame rate.")
             if self.previous_ns is not None and media < self.previous_ns:
                 raise ValueError("Video timestamps run backwards; accurate playback is unavailable.")
+            if self.previous_ns is not None and media > self.previous_ns:
+                self.intervals.append(media - self.previous_ns)
             self.previous_ns = media
             image = frame.to_ndarray(format="bgr24")
             latest = (image, index, media)
@@ -83,6 +87,10 @@ class VideoReader:
                 _, (old, _) = self.cache.popitem(last=False)
                 self.bytes -= old.nbytes
         return latest if not self.stop.is_set() else None
+
+    @property
+    def median_fps(self):
+        return 1e9 / median(self.intervals) if self.intervals else None
 
     def close(self):
         self.container.close()

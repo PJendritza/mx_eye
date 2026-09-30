@@ -416,6 +416,8 @@ def capture_worker(
                         report(events, "playback", achieved=achieved, requested=source.speed)
                 else:
                     playback_clock.reset()
+                if index < 10 or index % 30 == 0:
+                    report(events, "source", video_median_fps=reader.median_fps)
                 report_timing = reader.timing
                 if report_timing != getattr(reader, "reported_timing", None):
                     report(events, "source", video_timing=report_timing)

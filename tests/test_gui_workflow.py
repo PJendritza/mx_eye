@@ -93,6 +93,20 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch):
         assert [a.text() for a in window.menuBar().actions()] == [
             "File", "Settings", "Calibration", "Tools"
         ]
+        assert window.reason_label.isVisible()
+        assert window.playback_note.isVisible()
+        geometry = (window.eye.geometry(), window.full.geometry(), window.size())
+        window._playback_text = "Playback limited: 0.91× achieved / 1.00× requested"
+        window.update_alert()
+        app.processEvents()
+        assert (window.eye.geometry(), window.full.geometry(), window.size()) == geometry
+        window._playback_text = ""
+        window.update_alert()
+        app.processEvents()
+        assert (window.eye.geometry(), window.full.geometry(), window.size()) == geometry
+        window.service.source_info.update(mode=cfg.SourceMode.CAMERA, driver_fps=30)
+        window.refresh()
+        assert window.requested_fps.text() == "30 fps camera"
         assert window.start_button.isVisible()
         assert not window.open_button.isVisible()
         window.source.setCurrentIndex(window.source.findData(cfg.SourceMode.VIDEO.value))

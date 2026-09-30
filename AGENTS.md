@@ -73,7 +73,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
 - **Video layout:** equally sized eye-detail (left) and source (right) panels.
   Pupil/CR mask switches and Centers sit above eye detail. Template size and Template inset above
   the source independently toggle the template-radius circle and small template
-  preview. Click instructions stay below each video. Slider values sit beside
+  preview. Fixed-height warning rows stay below each video; click instructions are tooltips. Slider values sit beside
   their sliders in compact, collapsible groups.
 - **Configuration:** Save/Load JSON also preserves these display switches.
   Configurations include the template image. The file is a `format: "mx-eye"`,
@@ -438,3 +438,10 @@ Playback warnings use source-time advancement / monotonic elapsed time over two
 seconds, reset on pause, seek or speed changes, with a 95% threshold. Codec fields
 in old configurations are accepted but ignored. Pi recording throughput versus a
 standalone 60-FPS application remains a separate follow-up.
+
+Video FPS in the GUI is estimated from the median of up to 120 recent positive
+embedded timestamp intervals, independent of playback speed. Eye tracking
+rejections appear beneath eye detail; playback and session faults appear beneath
+the source view. Both rows remain allocated when empty, avoiding layout movement.
+The camera rate label uses driver_fps once capture reports it; otherwise it clearly
+labels the configured request. ACQ remains the measured host acquisition rate.

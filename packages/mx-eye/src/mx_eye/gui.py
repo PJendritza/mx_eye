@@ -254,10 +254,9 @@ class Window(W.QMainWindow):
         source_row.addWidget(self.source_label, 1)
         self.requested_fps = label("", "muted")
         source_row.addWidget(self.requested_fps)
+        self._playback_text = ""
         self.playback_note = label("", "muted")
         self.playback_note.setStyleSheet("color:#f0ad74;")
-        layout.addWidget(self.playback_note)
-        self.playback_note.hide()
         layout.addLayout(source_row)
         self.file_menu = self.menuBar().addMenu("File")
         for title, callback in [
@@ -295,7 +294,7 @@ class Window(W.QMainWindow):
         self.metrics.setToolTip("Acquisition, tracking and recording status")
         metrics_row.addWidget(self.metrics)
         self.reason_label = label("", "metricAlert")
-        metrics_row.addWidget(self.reason_label, 1)
+        metrics_row.addStretch()
         layout.addWidget(metrics_bar)
         split = W.QSplitter(C.Qt.Horizontal)
         layout.addWidget(split, 1)
@@ -373,9 +372,12 @@ class Window(W.QMainWindow):
                 box.hide()
             column.addLayout(header)
             column.addWidget(view, 1)
-            instructions = label(hint, "muted")
-            instructions.setWordWrap(True)
-            column.addWidget(instructions)
+            view.setToolTip(hint)
+            notice = self.reason_label if view is self.eye else self.playback_note
+            notice.setFixedHeight(notice.fontMetrics().height() + 8)
+            notice.setMinimumWidth(0)
+            notice.setSizePolicy(W.QSizePolicy.Ignored, W.QSizePolicy.Fixed)
+            column.addWidget(notice)
             views.addWidget(panel)
             view.action.connect(self.view_action)
         views.setSizes([460, 460])
@@ -619,11 +621,16 @@ class Window(W.QMainWindow):
         now = time.monotonic()
         error = self._error_text if now < self._error_until else ""
         reason = self._reason_text if now < self._reason_until else ""
-        message = error or (f"No valid position: {reason}" if reason else "")
+        message = f"No valid position: {reason}" if reason else ""
         self.reason_label.setToolTip(message)
         self.reason_label.setText(self.reason_label.fontMetrics().elidedText(
             message, C.Qt.ElideRight, max(0, self.reason_label.width() - 8)))
-        self.reason_label.setStyleSheet("color:#ff817f;" if error else "color:#f0ad74;")
+        self.reason_label.setStyleSheet("color:#f0ad74;")
+        message = error or self._playback_text
+        self.playback_note.setToolTip(message)
+        self.playback_note.setText(self.playback_note.fontMetrics().elidedText(
+            message, C.Qt.ElideRight, max(0, self.playback_note.width() - 8)))
+        self.playback_note.setStyleSheet("color:#ff817f;" if error else "color:#f0ad74;")
 
     def display_changed(self, suspended):
         self.display_pause.setText("Resume displays" if suspended else "Suspend displays")
@@ -1002,14 +1009,20 @@ class Window(W.QMainWindow):
         self.source_label.setText(self.source_label.fontMetrics().elidedText(
             name, C.Qt.ElideMiddle, max(0, self.source_label.width())))
         self.source_label.setToolTip(self.saved_source_path if mode is SourceMode.VIDEO else name)
-        fps = state.source.fps if mode is SourceMode.VIDEO else source.fps
         if mode is SourceMode.VIDEO:
-            timing = self.service.video_timing_info
-            self.requested_fps.setText("Timestamped recording" if timing == "Acquisition timestamps"
-                                      else f"{fps:g} fps nominal" if fps else "Timestamped video")
-            self.requested_fps.setToolTip(timing or "Reading video timing…")
+            median = self.service.video_median_fps
+            self.requested_fps.setText(f"≈ {median:.1f} fps median" if median else "Reading frame timing…")
+            self.requested_fps.setToolTip(
+                "Median of up to 120 recent positive frame intervals from embedded video timestamps. "
+                + self.service.video_timing_info)
+        elif mode is SourceMode.CAMERA:
+            reported = state.source.driver_fps if state.source.mode is SourceMode.CAMERA else None
+            self.requested_fps.setText(f"{reported:g} fps camera" if reported else f"{source.fps:g} fps requested")
+            self.requested_fps.setToolTip(
+                f"Requested {source.fps:g} fps. Camera-reported rate; ACQ shows measured acquisition rate."
+                if reported else "Requested rate; camera rate is available after acquisition starts if the driver reports it.")
         else:
-            self.requested_fps.setText(f"{fps:g} fps" + (" requested" if mode is SourceMode.CAMERA else ""))
+            self.requested_fps.setText(f"{source.fps:g} fps")
             self.requested_fps.setToolTip("")
         info = self.service.playback_info
         achieved, requested = info.get("achieved"), info.get("requested")
@@ -1017,9 +1030,8 @@ class Window(W.QMainWindow):
                    and achieved is not None and requested is not None
                    and abs(requested - self.speed.value()) < 1e-6
                    and achieved < requested * 0.95 and self.navigation_pending is None)
-        self.playback_note.setVisible(limited)
-        if limited:
-            self.playback_note.setText(f"Playback limited: {achieved:.2f}× achieved / {requested:.2f}× requested")
+        self._playback_text = (f"Playback limited: {achieved:.2f}× achieved / {requested:.2f}× requested"
+                               if limited else "")
         active = state.state in ("running", "starting", "stopping")
         self.start_button.setText("Stop" if active else "Start")
         self.start_button.setEnabled(not self.pending and state.state != "stopping")

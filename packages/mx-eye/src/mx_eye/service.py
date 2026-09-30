@@ -73,6 +73,7 @@ class Service:
         self.camera_control_info = ""
         self.recording_path_info = ""
         self.video_timing_info = ""
+        self.video_median_fps = None
         self.playback_info = {}
         self.priority_info = []
         self._server_errors = []
@@ -243,6 +244,7 @@ class Service:
         self.camera_control_info = ""
         self.recording_path_info = ""
         self.video_timing_info = ""
+        self.video_median_fps = None
         self.playback_info = {}
         self._preview = None
         self.directory = ""
@@ -412,6 +414,8 @@ class Service:
                                              if k in SourceStatus.model_fields})
                     if "camera_controls" in e:
                         self.camera_control_info = e["camera_controls"]
+                    if "video_median_fps" in e:
+                        self.video_median_fps = e["video_median_fps"]
                     if "video_timing" in e:
                         self.video_timing_info = e["video_timing"]
                     if "recording_path" in e:

@@ -71,6 +71,7 @@ class Service:
         self.directory = ""
         self.source_info = {}
         self.camera_control_info = ""
+        self.camera_mode_info = ""
         self.recording_path_info = ""
         self.video_timing_info = ""
         self.video_median_fps = None
@@ -242,6 +243,7 @@ class Service:
         self.priority_info = []
         self.source_info = {}
         self.camera_control_info = ""
+        self.camera_mode_info = ""
         self.recording_path_info = ""
         self.video_timing_info = ""
         self.video_median_fps = None
@@ -412,6 +414,8 @@ class Service:
                 elif kind in ("source", "dimensions"):
                     self.source_info.update({k: v for k, v in e.items()
                                              if k in SourceStatus.model_fields})
+                    if "camera_mode_info" in e:
+                        self.camera_mode_info = e["camera_mode_info"]
                     if "camera_controls" in e:
                         self.camera_control_info = e["camera_controls"]
                     if "video_median_fps" in e:

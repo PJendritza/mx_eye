@@ -13,7 +13,7 @@ from PySide6 import QtGui as G
 from PySide6 import QtWidgets as W
 
 from . import config as cfg
-from .cameras import CameraControls, CameraNameDiscovery
+from .cameras import CameraControls, CameraModeDiscovery
 from .config import (
     PUPIL_METHODS,
     PupilMethod,
@@ -87,7 +87,7 @@ class Settings(W.QDialog):
             form = W.QFormLayout(page)
             form.setVerticalSpacing(13)
             if title == "Camera":
-                self.camera_controls = CameraControls(config.value.source, self)
+                self.camera_controls = CameraControls(config.value.source, self, getattr(parent, "camera_discovery", None))
                 form.addRow(self.camera_controls)
             for key, text, *args in rows:
                 value = getattr(getattr(config.value, group), key)
@@ -580,16 +580,22 @@ class Window(W.QMainWindow):
         self.display_changed(self.display_pause.isChecked())
         add_tooltips(self)
         self.camera_names = {}
-        self.camera_name_discovery = CameraNameDiscovery(self)
-        self.camera_name_discovery.finished.connect(self.camera_names_received)
-        C.QTimer.singleShot(0, self.camera_name_discovery.start)
+        self.camera_discovery = CameraModeDiscovery(self)
+        self.camera_discovery.finished.connect(self.camera_modes_received)
+        C.QTimer.singleShot(0, self.ensure_camera_modes)
         W.QApplication.instance().installEventFilter(self)
 
-    def camera_names_received(self, names):
-        self.camera_names = names
-        selected = self.camera.value()
-        if selected in names and not self.service.run:
-            self.service.config.value.source.camera_name = names[selected]
+    def ensure_camera_modes(self):
+        if self.source_mode() is SourceMode.CAMERA and not self.service.run:
+            self.camera_discovery.ensure_loaded()
+
+    def camera_modes_received(self, cameras, error):
+        self.camera_names = {c['index']: c['name'] for c in cameras}
+        if not self.service.run:
+            from .camera_backend import validated_camera_source
+            source = self.service.config.value.source.model_copy(update={'camera': self.camera.value()})
+            self.service.config.value.source = validated_camera_source(source, cameras)
+            self.camera.setValue(self.service.config.value.source.camera)
 
     def source_mode(self):
         return SourceMode(self.source.currentData())
@@ -675,6 +681,14 @@ class Window(W.QMainWindow):
                 self.call("stop")
 
     def start(self):
+        if self.source_mode() is SourceMode.CAMERA:
+            self.ensure_camera_modes()
+            if self.camera_discovery.process is not None:
+                W.QMessageBox.information(self, "Camera modes", "Camera modes are still loading. Start again once discovery finishes.")
+                return
+            from .camera_backend import validated_camera_source
+            source = self.service.config.value.source.model_copy(update={'camera': self.camera.value()})
+            self.service.config.value.source = validated_camera_source(source, self.camera_discovery.cameras or [])
         self.send_parameters()
         config = cfg.MxEyeConfigStore(self.service.config.value.model_copy(deep=True))
         config.value.source.mode = self.source_mode()
@@ -691,6 +705,8 @@ class Window(W.QMainWindow):
         self.call("settings", config=config, callback=lambda: self.call("start"))
 
     def source_controls_changed(self, *args):
+        if hasattr(self, "camera_discovery"):
+            self.ensure_camera_modes()
         video = self.source_mode() is SourceMode.VIDEO
         self.open_button.setVisible(video)
         self.start_button.setVisible(not video)
@@ -1002,6 +1018,7 @@ class Window(W.QMainWindow):
                 self.start()
             else:
                 self.pending_video_path = None
+        self.ensure_camera_modes()
         source = self.service.config.value.source
         name = (Path(self.saved_source_path).name if mode is SourceMode.VIDEO
                 else "Simulation" if mode is SourceMode.SIMULATION
@@ -1016,11 +1033,11 @@ class Window(W.QMainWindow):
                 "Median of up to 120 recent positive frame intervals from embedded video timestamps. "
                 + self.service.video_timing_info)
         elif mode is SourceMode.CAMERA:
-            reported = state.source.driver_fps if state.source.mode is SourceMode.CAMERA else None
-            self.requested_fps.setText(f"{reported:g} fps camera" if reported else f"{source.fps:g} fps requested")
+            loading = self.camera_discovery.process is not None
+            self.requested_fps.setText("Loading camera modes…" if loading else f"{source.fps:g} fps requested")
             self.requested_fps.setToolTip(
-                f"Requested {source.fps:g} fps. Camera-reported rate; ACQ shows measured acquisition rate."
-                if reported else "Requested rate; camera rate is available after acquisition starts if the driver reports it.")
+                "Request validated against cached advertised modes when available. "
+                "ACQ shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
         else:
             self.requested_fps.setText(f"{source.fps:g} fps")
             self.requested_fps.setToolTip("")
@@ -1031,10 +1048,11 @@ class Window(W.QMainWindow):
                    and abs(requested - self.speed.value()) < 1e-6
                    and achieved < requested * 0.95 and self.navigation_pending is None)
         self._playback_text = (f"Playback limited: {achieved:.2f}× achieved / {requested:.2f}× requested"
-                               if limited else "")
+                               if limited else self.service.camera_mode_info if mode is SourceMode.CAMERA else "")
         active = state.state in ("running", "starting", "stopping")
         self.start_button.setText("Stop" if active else "Start")
-        self.start_button.setEnabled(not self.pending and state.state != "stopping")
+        self.start_button.setEnabled(not self.pending and state.state != "stopping"
+                                     and (active or mode is not SourceMode.CAMERA or self.camera_discovery.process is None))
         self.source.setEnabled(state.state != "stopping" and not self.pending)
         self.open_button.setEnabled(not self.pending and not self._closing)
         run = self.service.run
@@ -1251,7 +1269,7 @@ class Window(W.QMainWindow):
             event.ignore()
             C.QTimer.singleShot(100, self.close)
             return
-        self.camera_name_discovery.stop()
+        self.camera_discovery.stop()
         self.timer.stop()
         self.service.close()
         event.accept()

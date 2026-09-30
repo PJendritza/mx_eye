@@ -36,8 +36,8 @@ and provenance. The workspace members live in `packages/mx-eye`,
   resolution with a reported mode of at least 29 fps, or the fastest reported
   mode if none qualifies. Choose a resolution and camera format (for example,
   MJPG or YUY2) separately; the requested FPS starts at that format's reported
-  maximum. The source line shows the format and FPS reported by the opened camera,
-  while ACQ shows the measured rate. Discovery runs in a
+  maximum. The source line labels the configured FPS as requested,
+  while ACQ shows the measured frame-delivery rate. OpenCV FPS readback is not a verified camera rate. Discovery runs in a
   separate process and is available while tracking is stopped. If enumeration is
   unavailable, manual settings remain available. Other operating systems currently
   use manual camera settings. The Windows dependency comes from the `gui` extra
@@ -443,5 +443,11 @@ Video FPS in the GUI is estimated from the median of up to 120 recent positive
 embedded timestamp intervals, independent of playback speed. Eye tracking
 rejections appear beneath eye detail; playback and session faults appear beneath
 the source view. Both rows remain allocated when empty, avoiding layout movement.
-The camera rate label uses driver_fps once capture reports it; otherwise it clearly
-labels the configured request. ACQ remains the measured host acquisition rate.
+The camera label always identifies the configured request; ACQ is measured host
+frame delivery. A process-local CameraModeDiscovery cache is shared by Window and
+Settings, populated on startup/selection of Camera or on first Settings access.
+Explicit Refresh rescans; switching sources or reopening Settings reuses the cache.
+Supported saved resolution/format/FPS selections survive Settings. Invalid requests
+are repaired from advertised modes before Start; missing discovery leaves manual
+requests available. Capture reports rejected property requests and dimension/format
+mismatches beneath the source view. Mode discovery never runs during tracking.

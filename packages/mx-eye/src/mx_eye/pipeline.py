@@ -244,10 +244,16 @@ def capture_worker(
             camera_settings = source.model_dump(mode="json")
             backend = backend_for(camera_settings)
             cap = cv2.VideoCapture(camera_target(camera_settings), backend)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, source.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, source.height)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*source.fourcc))
-            cap.set(cv2.CAP_PROP_FPS, source.fps)
+            requests = [
+                ('width', cv2.CAP_PROP_FRAME_WIDTH, source.width),
+                ('height', cv2.CAP_PROP_FRAME_HEIGHT, source.height),
+                ('format', cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*source.fourcc)),
+                ('FPS', cv2.CAP_PROP_FPS, source.fps),
+            ]
+            failed_requests = [name for name, prop, value in requests if not cap.set(prop, value)]
+            mode_warnings = []
+            if failed_requests:
+                mode_warnings.append('Camera did not acknowledge: ' + ', '.join(failed_requests))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 raise RuntimeError("Cannot open camera. Check camera index/backend.")
@@ -275,6 +281,9 @@ def capture_worker(
             )
             if not actual_format.isprintable():
                 actual_format = "unknown"
+            if actual_format not in ("unknown", source.fourcc):
+                mode_warnings.append(f"Format readback {actual_format}; requested {source.fourcc}")
+            report(events, "source", camera_mode_info=" · ".join(mode_warnings))
             report(
                 events,
                 "source",
@@ -374,6 +383,9 @@ def capture_worker(
                         report(events, "source", recording_path="FFV1 · lossless encoding of decoded frames")
                     else:
                         first_size = probe.shape
+                        if probe.shape[:2] != (source.height, source.width):
+                            mode_warnings.append(f"Camera delivered {probe.shape[1]}×{probe.shape[0]}; requested {source.width}×{source.height}")
+                            report(events, "source", camera_mode_info=" · ".join(mode_warnings))
                         report(events, "dimensions", width=probe.shape[1], height=probe.shape[0])
                         report(events, "source", recording_path="Original camera MJPEG · no re-encoding")
                 elif not jpeg:
@@ -394,6 +406,9 @@ def capture_worker(
                 )
             if first_size is None:
                 first_size = frame.shape
+                if mode is SourceMode.CAMERA and not encoded and frame.shape[:2] != (source.height, source.width):
+                    mode_warnings.append(f"Camera delivered {frame.shape[1]}×{frame.shape[0]}; requested {source.width}×{source.height}")
+                    report(events, "source", camera_mode_info=" · ".join(mode_warnings))
                 report(
                     events, "dimensions", width=frame.shape[1], height=frame.shape[0]
                 )

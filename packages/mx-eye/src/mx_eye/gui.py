@@ -1033,8 +1033,13 @@ class Window(W.QMainWindow):
                 "Median of up to 120 recent positive frame intervals from embedded video timestamps. "
                 + self.service.video_timing_info)
         elif mode is SourceMode.CAMERA:
-            loading = self.camera_discovery.process is not None
-            self.requested_fps.setText("Loading camera modes…" if loading else f"{source.fps:g} fps requested")
+            camera = next(
+                (c for c in (self.camera_discovery.cameras or [])
+                 if c["index"] == source.camera),
+                None,
+            )
+            ready = self.camera_discovery.process is None and camera and camera["formats"]
+            self.requested_fps.setText(f"{source.fps:g} fps requested" if ready else "")
             self.requested_fps.setToolTip(
                 "Request validated against cached advertised modes when available. "
                 "ACQ shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")

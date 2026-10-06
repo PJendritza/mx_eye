@@ -7,7 +7,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, Self
 
-from mx_eye_protocol.control import SourceMode, Transport
+from mx_eye_protocol.control import SourceMode
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -127,8 +127,6 @@ class NetworkConfig(ConfigModel):
     bind: IPv4Address = IPv4Address("127.0.0.1")
     data_port: int = Field(default=5556, ge=1024, le=65535)
     control_port: int = Field(default=5557, ge=1024, le=65535)
-    transport: Transport = Transport.TCP
-    udp_host: IPv4Address = IPv4Address("127.0.0.1")
 
     @model_validator(mode="after")
     def validate_distinct_ports(self) -> "NetworkConfig":

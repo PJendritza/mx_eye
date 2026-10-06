@@ -105,11 +105,17 @@ class Receiver(W.QWidget):
         self.connected = False
         self.counted = 0
         self.newest = None
-        self.run(self.client.connect)
+        # SUB is asynchronous: create, read and close it on the GUI thread.
+        try:
+            self.client.connect()
+            self.connected = True
+            self.state.setText("Subscribed · waiting for samples")
+        except Exception as exc:  # noqa: BLE001 - report failures in the UI label
+            self.state.setText(str(exc))
 
     def record(self, sample):
         """Append one received sample to the trace, restarting on a new session."""
-        payload = sample.frame.payload
+        payload = sample.frame
         if (
             payload.session != self.session
             or payload.coordinate_system != self.coordinate_system
@@ -133,10 +139,7 @@ class Receiver(W.QWidget):
         if self.pending and self.pending.done():
             try:
                 reply = self.pending.result()
-                if isinstance(reply, MxEye):
-                    self.connected = True
-                    self.state.setText("Connected")
-                elif isinstance(reply, StatusSnapshot):
+                if isinstance(reply, StatusSnapshot):
                     self.state.setText(f"{reply.state} · {reply.message}")
             except Exception as exc:  # noqa: BLE001 - report failures in the UI label
                 self.state.setText(str(exc))
@@ -182,10 +185,10 @@ class Receiver(W.QWidget):
             validity = (
                 "STALE"
                 if stale
-                else ("VALID" if sample.frame.payload.valid else "LOST")
+                else ("VALID" if sample.frame.valid else "LOST")
             )
             self.metrics.setText(
-                f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.frame.payload.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
+                f"{validity}     {self.rate:.1f} Hz     PROCESS {number(sample.frame.processing_ms)} ms     NETWORK ≈{number(sample.network_ms)} ms     AGE NOW ≈{number(sample.age_ms)} ms"
             )
         self.info.setText(
             "Delay is measured from host read-return timestamps shared by both ends; it excludes exposure and camera/USB buffering. Raw, uncalibrated image-pixel signal."

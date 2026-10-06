@@ -1,6 +1,6 @@
 """CSV representation of tracking payloads, independent of the wire codec."""
 
-from mx_eye_protocol.data_frame import TrackingPayload
+from mx_eye_protocol.data_frame import DataFrame
 
 # Output column name -> payload attribute; insertion order is the CSV order.
 TRACKING_COLUMNS = {
@@ -24,7 +24,7 @@ TRACKING_COLUMNS = {
 }
 
 
-def tracking_row(payload: TrackingPayload) -> tuple[int | float, ...]:
+def tracking_row(payload: DataFrame) -> tuple[int | float, ...]:
     return tuple(
         int(payload.flags) if attribute == "flags" else getattr(payload, attribute)
         for attribute in TRACKING_COLUMNS.values()

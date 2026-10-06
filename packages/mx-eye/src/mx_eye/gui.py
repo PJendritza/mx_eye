@@ -20,14 +20,12 @@ from .config import (
     PupilCoordinates,
     SourceMode,
     TrackingMode,
-    Transport,
 )
 from .helptext import TIPS, add_tooltips
 from .service import Service
 from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
-    ("network", "transport"): Transport,
 }
 
 
@@ -47,14 +45,8 @@ class Settings(W.QDialog):
                 "network",
                 [
                     ("bind", "Tracker bind address", None),
-                    (
-                        "transport",
-                        "Sample transport",
-                        [item.value for item in Transport],
-                    ),
                     ("data_port", "Sample port", 1024, 65535),
                     ("control_port", "Command port", 1024, 65535),
-                    ("udp_host", "UDP receiver address", None),
                 ],
             ),
             "Recording": (
@@ -78,7 +70,7 @@ class Settings(W.QDialog):
         }
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
-            "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. UDP sends to one configured receiver. Control is unauthenticated: use only your trusted local network.",
+            "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. Samples use ZeroMQ PUB/SUB; commands use REQ/REP. Control is unauthenticated: use only your trusted local network.",
             "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, recording stops and is marked incomplete; tracking continues.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }

@@ -24,15 +24,15 @@ class Sample:
 
     @property
     def network_ms(self) -> float:
-        return (self.receive_ns - self.frame.payload.send_ns) / 1e6
+        return (self.receive_ns - self.frame.send_ns) / 1e6
 
     @property
     def arrival_age_ms(self) -> float:
-        return (self.receive_ns - self.frame.payload.acquisition_ns) / 1e6
+        return (self.receive_ns - self.frame.acquisition_ns) / 1e6
 
     def age_ms_at(self, now_ns: int) -> float:
         """Age measured at ``now_ns``, including time spent in the caller's code."""
-        return (now_ns - self.frame.payload.acquisition_ns) / 1e6
+        return (now_ns - self.frame.acquisition_ns) / 1e6
 
     @property
     def age_ms(self) -> float:
@@ -51,7 +51,7 @@ class Sample:
         diagnostics. A timestamp ahead of the receiver clock means the two ends
         are not reading the same clock, so the sample cannot be certified fresh.
         """
-        if require_valid and not self.frame.payload.valid:
+        if require_valid and not self.frame.valid:
             return False
         if max_age_ms is None:
             return True

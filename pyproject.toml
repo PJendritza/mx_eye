@@ -2,7 +2,7 @@
 members = ['packages/*']
 
 [tool.pytest.ini_options]
-testpaths = ['tests']
+testpaths = ['tests', 'packages/protocol/tests', 'packages/py-mx-eye/tests']
 
 [tool.pyright]
 include = [

@@ -23,6 +23,7 @@ from .config import (
 )
 from .helptext import TIPS, add_tooltips
 from .service import Service
+from .simulation import Simulation, SIMULATION_HINT
 from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
@@ -324,6 +325,9 @@ class Window(W.QMainWindow):
         views = W.QSplitter(C.Qt.Horizontal)
         self.full = EyeView()
         self.eye = EyeView(crop=True)
+        self.simulation_model = None
+        self.full.simulation_context = self.simulation_context
+        self.eye.simulation_context = self.simulation_context
 
         def toggle(text, key, default=True, color=None):
             box = W.QCheckBox(text)
@@ -364,7 +368,7 @@ class Window(W.QMainWindow):
                 box.hide()
             column.addLayout(header)
             column.addWidget(view, 1)
-            view.setToolTip(hint)
+            view.setToolTip(SIMULATION_HINT if self.source_mode() is SourceMode.SIMULATION else hint)
             notice = self.reason_label if view is self.eye else self.playback_note
             notice.setFixedHeight(notice.fontMetrics().height() + 8)
             notice.setMinimumWidth(0)
@@ -696,10 +700,25 @@ class Window(W.QMainWindow):
         config.value.tracking.template_tracking = self.template_on.isChecked()
         self.call("settings", config=config, callback=lambda: self.call("start"))
 
+    def simulation_context(self):
+        run = self.service.run
+        if not run or run.get("simulation") is None:
+            return None
+        source = self.service.config.value.source
+        if self.simulation_model is None or (self.simulation_model.width, self.simulation_model.height) != (source.width, source.height):
+            self.simulation_model = Simulation(source.width, source.height)
+        shared = run["simulation"]
+        with shared.get_lock():
+            return self.simulation_model, tuple(shared)
+
     def source_controls_changed(self, *args):
         if hasattr(self, "camera_discovery"):
             self.ensure_camera_modes()
         video = self.source_mode() is SourceMode.VIDEO
+        if hasattr(self, "full"):
+            for view, normal in ((self.full, "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom"),
+                                 (self.eye, "Left-click pupil · Right-click CR · Shift-click template")):
+                view.setToolTip(SIMULATION_HINT if self.source_mode() is SourceMode.SIMULATION else normal)
         self.open_button.setVisible(video)
         self.start_button.setVisible(not video)
         self.record_button.setEnabled(False)

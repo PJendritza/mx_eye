@@ -1,6 +1,7 @@
 """Qt widgets used only by the desktop apps."""
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -172,6 +173,9 @@ class EyeView(W.QWidget):
     def __init__(self, crop=False):
         super().__init__()
         self.crop = crop
+        self.simulation_context = None
+        self.simulation_drag = None
+        self.simulation_last_move = 0
         self.image = None
         self.result = {}
         self.origin = (0, 0)
@@ -434,11 +438,34 @@ class EyeView(W.QWidget):
                 )
             painter.restore()
 
+    def _simulation_move(self, point):
+        mode, old, initial = self.simulation_drag
+        if mode == "head":
+            position = (initial[0] + point[0] - old[0], initial[1] + point[1] - old[1])
+        else:
+            from .simulation import Simulation
+            position = Simulation.gaze(point, initial)
+        self.action.emit("simulation", dict(gesture=mode, position=position))
+
     def mousePressEvent(self, event):
         p = self._source(event)
         if p is None:
             return
         shift = bool(event.modifiers() & C.Qt.ShiftModifier)
+        context = self.simulation_context() if self.simulation_context else None
+        if context and shift and not event.modifiers() & C.Qt.ControlModifier:
+            self.action.emit("template", dict(point=p))
+            return
+        if context and not (shift or event.modifiers() & C.Qt.ControlModifier):
+            model, state = context
+            self.drag = None
+            if event.button() == C.Qt.RightButton:
+                self.action.emit("simulation", dict(gesture="blink"))
+            elif event.button() == C.Qt.LeftButton:
+                center = model.eye_at(p, state)
+                self.simulation_drag = ("gaze", p, center) if center else ("head", p, state[:2])
+                self._simulation_move(p)
+            return
         if self.crop:
             if shift:
                 self.action.emit("template", dict(point=p))
@@ -473,6 +500,12 @@ class EyeView(W.QWidget):
 
     def mouseMoveEvent(self, event):
         p = self._source(event)
+        if self.simulation_drag is not None:
+            now = time.monotonic()
+            if p is not None and now - self.simulation_last_move >= .04:
+                self.simulation_last_move = now
+                self._simulation_move(p)
+            return
         if self.drag is None or p is None:
             return
         mode, old, roi, search = self.drag
@@ -496,6 +529,12 @@ class EyeView(W.QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self.simulation_drag is not None:
+            point = self._source(event)
+            if point is not None:
+                self._simulation_move(point)
+            self.simulation_drag = None
+            return
         self.drag_preview = None
         self.update()
         p = self._source(event)

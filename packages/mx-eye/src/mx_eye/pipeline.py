@@ -6,7 +6,6 @@ import json
 import math
 import os
 import queue
-import shutil
 import signal
 import time
 from pathlib import Path
@@ -21,17 +20,16 @@ from mx_eye_protocol.data_frame import (
 
 from .config import (
     PupilCoordinates,
-    RecordingCodec,
     SourceMode,
     TrackingMode,
 )
 from .recording import TRACKING_COLUMNS, tracking_row
-from .recording import MjpegCopyWriter
+from .recording import TimestampedVideoWriter
 from .camera_backend import backend_for, camera_target, apply_controls
 from .config import TrackingConfig
 from .tracking import Tracker
 from .transport import Publisher
-from .video import VideoReader
+from .video import PlaybackClock, VideoReader
 
 
 class Mailbox:
@@ -80,7 +78,7 @@ class FrameRing:
     def __init__(self, ctx, max_bytes, capacity):
         self.max_bytes, self.capacity = max_bytes, capacity
         self.pixels = ctx.RawArray("B", max_bytes * capacity)
-        self.meta = ctx.RawArray("q", 5 * capacity)
+        self.meta = ctx.RawArray("q", 6 * capacity)
         self.free = ctx.Semaphore(capacity)
         self.ready = ctx.Semaphore(0)
         self.write_index = ctx.RawValue("q", 0)
@@ -94,7 +92,7 @@ class FrameRing:
             self.pixels, np.uint8, count=frame.size, offset=i * self.max_bytes
         )[:] = frame.reshape(-1)
         shape = (-1, frame.size) if frame.ndim == 1 else frame.shape[:2]
-        self.meta[i * 5 : i * 5 + 5] = [*meta, *shape]
+        self.meta[i * 6 : i * 6 + 6] = [*meta, *shape]
         self.write_index.value += 1
         self.ready.release()
         return True
@@ -103,7 +101,7 @@ class FrameRing:
         if not self.ready.acquire(timeout=timeout):
             return None
         i = self.read_index.value % self.capacity
-        fid, acquired, media, h, w = self.meta[i * 5 : i * 5 + 5]
+        fid, acquired, media, monotonic_ns, h, w = self.meta[i * 6 : i * 6 + 6]
         frame = np.frombuffer(self.pixels, np.uint8,
                               count=w if h == -1 else h * w * 3,
                               offset=i * self.max_bytes)
@@ -113,7 +111,7 @@ class FrameRing:
         if copy:
             frame = frame.copy()
             self.free.release()
-        return frame, (fid, acquired, media)
+        return frame, (fid, acquired, media, monotonic_ns)
 
     def release(self):
         self.free.release()
@@ -232,46 +230,41 @@ def capture_worker(
     due = time.perf_counter()
     first_size = None
     encoded = False
+    playback_clock = PlaybackClock()
     try:
         mode = source.mode
-        if mode is not SourceMode.SIMULATION:
+        if mode is SourceMode.VIDEO:
+            reader = VideoReader(source.path, stop)
+            fps, total = reader.fps, reader.estimated_total
+            report(events, "source", video_timing=reader.timing)
+        elif mode is SourceMode.CAMERA:
             camera_settings = source.model_dump(mode="json")
             backend = backend_for(camera_settings)
-            if mode is SourceMode.VIDEO:
-                reader = VideoReader(source.path, stop)
-                cap = reader.cap
-            else:
-                cap = cv2.VideoCapture(camera_target(camera_settings), backend)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, source.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, source.height)
-                # Changing dimensions can renegotiate the camera format.
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*source.fourcc))
-                cap.set(cv2.CAP_PROP_FPS, source.fps)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap = cv2.VideoCapture(camera_target(camera_settings), backend)
+            requests = [
+                ('width', cv2.CAP_PROP_FRAME_WIDTH, source.width),
+                ('height', cv2.CAP_PROP_FRAME_HEIGHT, source.height),
+                ('format', cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*source.fourcc)),
+                ('FPS', cv2.CAP_PROP_FPS, source.fps),
+            ]
+            failed_requests = [name for name, prop, value in requests if not cap.set(prop, value)]
+            mode_warnings = []
+            if failed_requests:
+                mode_warnings.append('Camera did not acknowledge: ' + ', '.join(failed_requests))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
-                raise RuntimeError(
-                    "Cannot open source. Check camera index/backend or video path."
-                )
-            if mode is SourceMode.CAMERA:
-                try:
-                    report(events, "source", camera_controls=apply_controls(cap, camera_settings))
-                except Exception as exc:
-                    report(events, "source", camera_controls=f"Camera control request failed: {exc}")
-                if (backend == cv2.CAP_V4L2 and config.value.recording.codec is RecordingCodec.MJPG
-                    and config.value.recording.camera_mjpeg_passthrough
-                    and source.fourcc in ("MJPG", "JPEG") and shutil.which("ffmpeg")):
-                    encoded = bool(cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))
+                raise RuntimeError("Cannot open camera. Check camera index/backend.")
+            try:
+                report(events, "source", camera_controls=apply_controls(cap, camera_settings))
+            except Exception as exc:
+                report(events, "source", camera_controls=f"Camera control request failed: {exc}")
+            # V4L2 can expose original JPEG packets. Other backends deliver decoded
+            # pixels, which are recorded losslessly with FFV1.
+            if backend == cv2.CAP_V4L2 and source.fourcc in ("MJPG", "JPEG"):
+                encoded = bool(cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))
             reported_fps = cap.get(cv2.CAP_PROP_FPS)
-            fps = (
-                reported_fps
-                if math.isfinite(reported_fps) and 1 <= reported_fps <= 1000
-                else source.fps
-            )
-            total = (
-                int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                if mode is SourceMode.VIDEO
-                else 0
-            )
+            fps = reported_fps if math.isfinite(reported_fps) and 1 <= reported_fps <= 1000 else source.fps
+            total = 0
         else:
             fps, total = source.fps, 0
         stats["source_fps"].value = fps
@@ -285,6 +278,9 @@ def capture_worker(
             )
             if not actual_format.isprintable():
                 actual_format = "unknown"
+            if actual_format not in ("unknown", source.fourcc):
+                mode_warnings.append(f"Format readback {actual_format}; requested {source.fourcc}")
+            report(events, "source", camera_mode_info=" · ".join(mode_warnings))
             report(
                 events,
                 "source",
@@ -305,7 +301,8 @@ def capture_worker(
                     cmd = commands.get_nowait()
                     if mode is SourceMode.VIDEO and cmd["command"] == "speed":
                         source.speed = cmd["speed"]
-                        due = time.perf_counter()
+                        playback_clock.reset()
+                        report(events, "playback", achieved=None, requested=source.speed)
                     if mode is SourceMode.VIDEO and cmd["command"] == "seek":
                         index = max(0, int(cmd["frame"]))
                         navigation_id = cmd.get("navigation_id", navigation_id)
@@ -321,7 +318,8 @@ def capture_worker(
                         paused.set()
                         step = True
                     if step:
-                        due = time.perf_counter()
+                        playback_clock.reset()
+                        report(events, "playback", achieved=None, requested=source.speed)
                         break  # Process each frame-step command on its own frame.
             except queue.Empty:
                 pass
@@ -333,10 +331,12 @@ def capture_worker(
             ):
                 paused.set()  # Keep the last frame available for backward stepping.
             if mode is SourceMode.VIDEO and paused.is_set() and not step and fid:
+                if playback_clock.anchor_wall is not None:
+                    report(events, "playback", achieved=None, requested=source.speed)
+                playback_clock.reset()
                 stop.wait(0.005)
-                due = time.perf_counter()
                 continue
-            if mode in (SourceMode.VIDEO, SourceMode.SIMULATION):
+            if mode is SourceMode.SIMULATION:
                 delay = due - time.perf_counter()
                 if delay > 0 and stop.wait(delay):
                     break
@@ -344,17 +344,22 @@ def capture_worker(
                 frame = synthetic_frame(index, source.width, source.height, fps)
                 ok = True
             elif mode is SourceMode.VIDEO:
+                requested_index = index
                 decoded = reader.read(index)
                 ok = decoded is not None
                 if ok:
-                    frame, index, msec = decoded
+                    frame, index, media = decoded
                 if reader.total is not None:
                     total = reader.total
+                    if total == 0:
+                        raise ValueError("Video contains no decodable frames.")
                     report(events, "source", total=total, total_exact=True)
-                    if index >= total - 1:
+                    if requested_index >= total and not step:
                         paused.set()
+                        continue
             else:
                 ok, frame = cap.read()
+            acquired_monotonic_ns = time.monotonic_ns()
             acquired = time.time_ns()  # Host read-return time, NOT sensor exposure.
             if ok and mode is SourceMode.CAMERA and encoded:
                 flat = frame.reshape(-1)
@@ -370,12 +375,16 @@ def capture_worker(
                         encoded = False
                         cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
                         ok, frame = cap.read()
+                        acquired_monotonic_ns = time.monotonic_ns()
                         acquired = time.time_ns()
-                        report(events, "source", recording_path="Decoded full-resolution frames")
+                        report(events, "source", recording_path="FFV1 · lossless encoding of decoded frames")
                     else:
                         first_size = probe.shape
+                        if probe.shape[:2] != (source.height, source.width):
+                            mode_warnings.append(f"Camera delivered {probe.shape[1]}×{probe.shape[0]}; requested {source.width}×{source.height}")
+                            report(events, "source", camera_mode_info=" · ".join(mode_warnings))
                         report(events, "dimensions", width=probe.shape[1], height=probe.shape[0])
-                        report(events, "source", recording_path="Original camera MJPEG; no re-encoding")
+                        report(events, "source", recording_path="Original camera MJPEG · no re-encoding")
                 elif not jpeg:
                     raise RuntimeError("Camera stopped returning complete JPEG packets.")
                 if encoded:
@@ -394,20 +403,44 @@ def capture_worker(
                 )
             if first_size is None:
                 first_size = frame.shape
+                if mode is SourceMode.CAMERA and not encoded and frame.shape[:2] != (source.height, source.width):
+                    mode_warnings.append(f"Camera delivered {frame.shape[1]}×{frame.shape[0]}; requested {source.width}×{source.height}")
+                    report(events, "source", camera_mode_info=" · ".join(mode_warnings))
                 report(
                     events, "dimensions", width=frame.shape[1], height=frame.shape[0]
                 )
             elif not encoded and frame.shape != first_size:
                 raise RuntimeError("Source dimensions changed during the session.")
-            media = -1
             if mode is SourceMode.VIDEO:
-                media = (
-                    int(msec * 1e6)
-                    if math.isfinite(msec) and (msec > 0 or index == 0)
-                    else int(index / fps * 1e9)
-                )
+                if not step:
+                    delay = playback_clock.delay(media, time.monotonic(), source.speed)
+                    deadline = time.monotonic() + delay
+                    while time.monotonic() < deadline and not stop.is_set():
+                        if paused.is_set() or not commands.empty():
+                            break
+                        stop.wait(min(0.01, max(0, deadline - time.monotonic())))
+                    if stop.is_set():
+                        break
+                    if paused.is_set() or not commands.empty():
+                        continue
+                    achieved = playback_clock.measured_speed(media, time.monotonic())
+                    if achieved is not None:
+                        report(events, "playback", achieved=achieved, requested=source.speed)
+                else:
+                    playback_clock.reset()
+                if index < 10 or index % 30 == 0:
+                    report(events, "source", video_median_fps=reader.median_fps)
+                report_timing = reader.timing
+                if report_timing != getattr(reader, "reported_timing", None):
+                    report(events, "source", video_timing=report_timing)
+                    reader.reported_timing = report_timing
+                # Replay processing timestamps describe the current run. Original
+                # acquisition-relative timing is carried separately in media_ns.
+                acquired = time.time_ns()
             elif mode is SourceMode.SIMULATION:
                 media = int(index / fps * 1e9)
+            else:
+                media = -1
             fid += 1
             stats["acquired"].value = fid
             stats["source_index"].value = index
@@ -424,7 +457,7 @@ def capture_worker(
                     and (recording is None or recording.is_set())):
                 if "record_acquired" in stats:
                     stats["record_acquired"].value += 1
-                if ring.put(frame, (fid, acquired, media)):
+                if ring.put(frame, (fid, acquired, media, acquired_monotonic_ns)):
                     stats["enqueued"].value += 1
                 else:
                     stats["record_fault"].value = 1
@@ -437,7 +470,9 @@ def capture_worker(
             if mode is SourceMode.VIDEO:
                 while not stop.is_set() and tracked_frame.value < fid:
                     stop.wait(0.0005)
-            if mode in (SourceMode.VIDEO, SourceMode.SIMULATION):
+                if reader.total is not None and index >= reader.total:
+                    paused.set()
+            if mode is SourceMode.SIMULATION:
                 due = max(due + 1 / (fps * source.speed), time.perf_counter())
     except Exception as exc:
         stats["capture_fault"].value = 1
@@ -549,7 +584,7 @@ def tracking_worker(
                 if (
                     media >= 0
                     and last_media >= 0
-                    and (media <= last_media or media - last_media > 2e9)
+                    and (media < last_media or media - last_media > 2e9)
                 ):
                     core.clear_feature_history()
                 last_media = media
@@ -712,7 +747,7 @@ def writer_worker(
     video_index = 0
     sample_count = 0
     log_finished = False
-    shape = None
+    first_monotonic = last_monotonic = None
     frame_file = sample_file = None
     try:
         folder.mkdir(parents=True, exist_ok=False)
@@ -720,7 +755,7 @@ def writer_worker(
         frame_file = (folder / "frames.csv").open("w", newline="", encoding="utf-8")
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
         fw, sw = csv.writer(frame_file), csv.writer(sample_file)
-        fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns"])
+        fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns", "acquisition_monotonic_ns"])
         sw.writerow(TRACKING_COLUMNS)
         report(events, "writer_ready")
         while True:
@@ -736,31 +771,23 @@ def writer_worker(
                     break
             item = ring.get(timeout=0.01, copy=False)
             if item is not None:
-                frame, (fid, acquired, media) = item
+                frame, (fid, acquired, media, acquired_monotonic_ns) = item
                 try:
                     if writer is None:
                         fps = stats["source_fps"].value or config.value.source.fps
-                        filename = (
-                            "video.avi" if config.value.recording.codec is RecordingCodec.MJPG
-                            else "video.mkv"
-                        )
-                        if frame.ndim == 1:
-                            writer = MjpegCopyWriter(folder / filename, fps)
-                        else:
-                            shape = frame.shape[:2]
-                            writer = cv2.VideoWriter(
-                                str(folder / filename),
-                                cv2.VideoWriter_fourcc(*config.value.recording.codec),
-                                fps, (shape[1], shape[0]),
-                            )
-                            if not writer.isOpened():
-                                raise RuntimeError("Video encoder could not open. Try MJPG or another recording directory.")
+                        filename = "video.mkv"
+                        writer = TimestampedVideoWriter(folder / filename, fps)
+                        first_monotonic = acquired_monotonic_ns
                     if test_delay:
                         time.sleep(test_delay)
-                    writer.write(frame)
+                    writer.write(frame, acquired_monotonic_ns)
+                    if video_index == 0:
+                        report(events, "source", recording_path=("MKV · original MJPEG packets"
+                               if writer.codec == "mjpeg_copy" else "MKV · lossless FFV1"))
+                    last_monotonic = acquired_monotonic_ns
                 finally:
                     ring.release()
-                fw.writerow([video_index, fid, acquired, media])
+                fw.writerow([video_index, fid, acquired, media, acquired_monotonic_ns])
                 video_index += 1
                 stats["written"].value = video_index
                 if video_index % 60 == 0:
@@ -803,16 +830,18 @@ def writer_worker(
                 error = str(exc)
                 stats["record_fault"].value = 2
                 report(events, "record_error", message=error)
-            # OpenCV write() has no per-frame success return. Verify the finalized
-            # container is readable and reports the expected frame count.
-            check = cv2.VideoCapture(str(folder / filename))
-            count = int(check.get(cv2.CAP_PROP_FRAME_COUNT)) if check.isOpened() else -1
-            readable, _ = check.read()
-            check.release()
-            if not readable or count != video_index:
-                error = f"Video finalization check failed: expected {video_index} frames, container reports {count}."
-                stats["record_fault"].value = 2
-                report(events, "record_error", message=error)
+            # Frame counts in VFR container headers can be estimates. A count
+            # mismatch is not proof of missing frames; errors are raised by muxing.
+            if video_index:
+                try:
+                    import av
+                    with av.open(str(folder / "video.mkv")) as check:
+                        if next(check.decode(video=0), None) is None:
+                            raise ValueError("Finalized recording has no readable video frame.")
+                except Exception as exc:
+                    error = f"Video finalization check failed: {exc}"
+                    stats["record_fault"].value = 2
+                    report(events, "record_error", message=error)
         for file in (frame_file, sample_file):
             if file is not None:
                 file.close()
@@ -831,7 +860,10 @@ def writer_worker(
             recording_fault=int(stats["record_fault"].value),
             error=error,
             timestamp_basis="host wall clock (CLOCK_REALTIME) immediately after read(); NTP/PTP-shared; not exposure time",
-            video_timing="constant nominal FPS; use frames.csv for measured frame times",
+            video_timing="embedded PTS from monotonic acquisition times; final frame duration uses the preceding interval",
+            video_codec=writer.codec if writer is not None else None,
+            timestamp_resolution="MKV timestamps may be quantized by muxer; CSV preserves nanoseconds",
+            recorded_span_ns=(last_monotonic - first_monotonic) if last_monotonic is not None else 0,
             camera_driver_drops="not observable through this UVC/OpenCV backend",
         )
         try:

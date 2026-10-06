@@ -139,6 +139,7 @@ class NetworkConfig(ConfigModel):
 class RecordingConfig(ConfigModel):
     directory: str = "recordings"
     buffer_mb: int = Field(default=128, ge=8, le=2048)
+    # Legacy options remain loadable; recording now chooses MJPEG-copy or FFV1 automatically.
     codec: RecordingCodec = RecordingCodec.MJPG
     record_simulation: bool = False
     camera_mjpeg_passthrough: bool = True

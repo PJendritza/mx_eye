@@ -31,44 +31,86 @@ def tracking_row(payload: DataFrame) -> tuple[int | float, ...]:
     )
 
 
-"""Mux already-compressed camera JPEGs; no video decode or encoder in this path."""
-import subprocess
+class TimestampedVideoWriter:
+    """One MKV frame per acquired image; monotonic acquisition time is its PTS."""
 
+    def __init__(self, path, nominal_fps):
+        import av
+        from fractions import Fraction
 
-class MjpegCopyWriter:
-    def __init__(self, path, fps):
-        self.log = path.with_suffix('.ffmpeg.log').open('wb')
-        try:
-            self.process = subprocess.Popen(
-                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
-                 '-f', 'mjpeg', '-framerate', str(fps), '-i', 'pipe:0',
-                 '-map', '0:v:0', '-c:v', 'copy', '-an', '-y', str(path)],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log, bufsize=0)
-        except Exception:
-            self.log.close()
-            raise
+        self.av = av
+        self.time_base = Fraction(1, 1_000_000)
+        self.container = av.open(str(path), "w", format="matroska")
+        self.container.metadata["MX_EYE_TIMING"] = "acquisition_monotonic"
+        self.rate = Fraction(str(nominal_fps or 30)).limit_denominator(100000)
+        self.stream = None
+        self.origin = self.last_ns = None
+        self.pending = None
+        self.last_duration = max(1, round(1 / self.rate / self.time_base))
+        self.codec = None
+        self.shape = None
 
-    def write(self, frame):
-        view = memoryview(frame).cast('B')
-        while view:
-            size = self.process.stdin.write(view)
-            if not size:
-                raise IOError('FFmpeg stopped accepting video packets; inspect video.ffmpeg.log.')
-            view = view[size:]
+    def write(self, image, acquired_monotonic_ns):
+        import io
+
+        if self.last_ns is not None and acquired_monotonic_ns <= self.last_ns:
+            raise ValueError("Acquisition timestamps must increase strictly.")
+        if self.stream is None:
+            self.origin = acquired_monotonic_ns
+            if image.ndim == 1:
+                # Probe only the first JPEG; subsequent packets are copied unchanged.
+                with self.av.open(io.BytesIO(image.tobytes()), format="mjpeg") as source:
+                    self.stream = self.container.add_stream_from_template(source.streams.video[0])
+                self.codec = "mjpeg_copy"
+            else:
+                self.stream = self.container.add_stream("ffv1", rate=self.rate)
+                self.stream.width, self.stream.height = image.shape[1], image.shape[0]
+                self.stream.pix_fmt = "bgr0"
+                self.stream.codec_context.thread_count = 1
+                self.stream.codec_context.time_base = self.time_base
+                self.codec = "ffv1"
+                self.shape = image.shape
+            self.stream.time_base = self.time_base
+        pts = (acquired_monotonic_ns - self.origin + 500) // 1000
+        self.last_ns = acquired_monotonic_ns
+        if self.codec == "mjpeg_copy":
+            if image.ndim != 1:
+                raise ValueError("Camera changed from compressed to decoded frames.")
+            packet = self.av.Packet(image.tobytes())
+            packet.stream = self.stream
+            packet.pts = packet.dts = pts
+            packet.time_base = self.time_base
+            packet.is_keyframe = True
+            self._mux(packet)
+        else:
+            if image.shape != self.shape:
+                raise ValueError("Source dimensions changed during recording.")
+            frame = self.av.VideoFrame.from_ndarray(image, format="bgr24")
+            frame.pts, frame.time_base = pts, self.time_base
+            for packet in self.stream.encode(frame):
+                self._mux(packet)
+
+    def _mux(self, packet):
+        if self.pending is not None:
+            duration = round((packet.pts * packet.time_base
+                              - self.pending.pts * self.pending.time_base)
+                             / self.pending.time_base)
+            if duration <= 0:
+                raise ValueError("Video timestamps are not strictly increasing.")
+            self.pending.duration = duration
+            self.last_duration = duration
+            self.container.mux(self.pending)
+        self.pending = packet
 
     def release(self):
         try:
-            try:
-                self.process.stdin.close()
-            except BrokenPipeError:
-                pass  # Still reap the failed process and report its exit code.
-            try:
-                code = self.process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-                raise IOError('FFmpeg did not finalize the video in time.')
-            if code:
-                raise IOError(f'FFmpeg failed ({code}); inspect video.ffmpeg.log.')
+            if self.codec == "ffv1":
+                for packet in self.stream.encode(None):
+                    self._mux(packet)
+            if self.pending is not None:
+                # The final frame has no successor: use the last observed interval.
+                self.pending.duration = self.last_duration
+                self.container.mux(self.pending)
+                self.pending = None
         finally:
-            self.log.close()
+            self.container.close()

@@ -80,6 +80,20 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6 import QtWidgets as W
     from mx_eye.gui import Settings, Window
+    from mx_eye.cameras import CameraModeDiscovery
+    from mx_eye.config import SourceConfig
+
+    cameras = [dict(index=0, name="Test camera", device="", backend="dshow", controls={}, error="",
+                    formats=[dict(width=640, height=480, fourcc="MJPG", fps=30, min_fps=5)])]
+    original_ensure = CameraModeDiscovery.ensure_loaded
+    scans = []
+    def fake_scan(discovery, force=False):
+        if discovery.cameras is None or force:
+            scans.append(True)
+            discovery.complete(cameras)
+        else:
+            original_ensure(discovery)
+    monkeypatch.setattr(CameraModeDiscovery, "ensure_loaded", fake_scan)
 
     app = W.QApplication.instance() or W.QApplication([])
     config = cfg.MxEyeConfigStore.defaults()
@@ -93,6 +107,35 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch):
         assert [a.text() for a in window.menuBar().actions()] == [
             "File", "Settings", "Calibration", "Tools"
         ]
+        assert window.reason_label.isVisible()
+        assert window.playback_note.isVisible()
+        geometry = (window.eye.geometry(), window.full.geometry(), window.size())
+        window._playback_text = "Playback limited: 0.91× achieved / 1.00× requested"
+        window.update_alert()
+        app.processEvents()
+        assert (window.eye.geometry(), window.full.geometry(), window.size()) == geometry
+        window._playback_text = ""
+        window.update_alert()
+        app.processEvents()
+        assert (window.eye.geometry(), window.full.geometry(), window.size()) == geometry
+        window.service.source_info.update(mode=cfg.SourceMode.CAMERA, driver_fps=30)
+        window.refresh()
+        assert window.requested_fps.text() == "30 fps requested"
+        assert config.value.source.fps == 30
+        assert len(scans) == 1
+        config.value.source = SourceConfig(**dict(config.value.source.model_dump(), fps=15))
+        dialog = Settings(config, window)
+        assert dialog.camera_controls.discovery is window.camera_discovery
+        assert dialog.camera_controls.fps.value() == 15
+        assert len(scans) == 1
+        dialog.camera_controls.resolution.setCurrentIndex(0)
+        dialog.camera_controls.scan()
+        assert len(scans) == 2
+        assert dialog.camera_controls.fps.value() == 15
+        dialog.reject()
+        window.service.source_info['driver_fps'] = 120
+        window.refresh()
+        assert window.requested_fps.text() == "15 fps requested"
         assert window.start_button.isVisible()
         assert not window.open_button.isVisible()
         window.source.setCurrentIndex(window.source.findData(cfg.SourceMode.VIDEO.value))

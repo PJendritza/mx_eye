@@ -130,3 +130,30 @@ tracking-loop duration, skipped frames, send errors, buffer backlog, and GUI tim
 GUI callback timing is collected only while the diagnostics window is visible.
 Detailed per-stage profiling and calibration tools are planned separately;
 Calibration is currently a menu placeholder.
+
+### Timestamped recording and playback
+
+Recordings use `video.mkv` with per-frame presentation timestamps derived from
+monotonic host acquisition time. Accessible camera MJPEG packets are copied without
+re-encoding; decoded BGR frames use lossless FFV1. The Windows OpenCV camera path
+normally provides decoded frames and therefore uses FFV1, even for a camera set to
+MJPG. Codec selection is automatic. Legacy codec settings remain loadable but no
+longer control recording. PyAV supplies the video reader/writer through the GUI extra.
+
+`frames.csv` keeps its existing columns and adds `acquisition_monotonic_ns`;
+`tracking.csv` retains its 17-column schema. Wall-clock timestamps still support
+cross-device synchronization; monotonic timestamps drive video intervals. Neither
+is a sensor exposure timestamp. MKV timestamp precision depends on the muxer
+(typically milliseconds); the CSV retains nanosecond values. The final frame's
+duration uses the preceding interval because it has no successor.
+
+Playback follows embedded timestamps, with a valid file FPS fallback only when
+frame timestamps are absent. It never reads `frames.csv` or borrows camera FPS.
+Older recordings play according to their existing embedded timing; they are not
+repaired. Pauses, seeks and speed changes reset the playback clock. Processing keeps
+every frame; a sustained shortfall below 95% of the requested speed displays
+“Playback limited”, measured over two-second windows. ACQ still reports throughput.
+
+Follow-up (not addressed here): on the Raspberry Pi, a standalone recording
+application achieves 60 FPS while mx_eye recording appears slower. Compare the
+capture/recording paths and profile the cause separately after validating timing.

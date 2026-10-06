@@ -13,12 +13,11 @@ from PySide6 import QtGui as G
 from PySide6 import QtWidgets as W
 
 from . import config as cfg
-from .cameras import CameraControls, CameraNameDiscovery
+from .cameras import CameraControls, CameraModeDiscovery
 from .config import (
     PUPIL_METHODS,
     PupilMethod,
     PupilCoordinates,
-    RecordingCodec,
     SourceMode,
     TrackingMode,
 )
@@ -27,7 +26,6 @@ from .service import Service
 from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
-    ("recording", "codec"): RecordingCodec,
 }
 
 
@@ -56,8 +54,6 @@ class Settings(W.QDialog):
                 [
                     ("directory", "Output folder", None),
                     ("buffer_mb", "Buffer size (MiB)", 8, 2048),
-                    ("codec", "Codec", [item.value for item in RecordingCodec]),
-                    ("camera_mjpeg_passthrough", "Use original camera MJPEG when available", True),
                 ],
             ),
             "View": (
@@ -75,7 +71,7 @@ class Settings(W.QDialog):
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
             "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. Samples use ZeroMQ PUB/SUB; commands use REQ/REP. Control is unauthenticated: use only your trusted local network.",
-            "Recording": "MJPG: fast, lossy AVI. FFV1: lossless MKV, higher CPU demand. Full source frames are saved without overlays. Buffer overflow stops recording and marks the session incomplete; tracking continues.",
+            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, recording stops and is marked incomplete; tracking continues.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }
         for title, (group, rows) in specs.items():
@@ -83,7 +79,7 @@ class Settings(W.QDialog):
             form = W.QFormLayout(page)
             form.setVerticalSpacing(13)
             if title == "Camera":
-                self.camera_controls = CameraControls(config.value.source, self)
+                self.camera_controls = CameraControls(config.value.source, self, getattr(parent, "camera_discovery", None))
                 form.addRow(self.camera_controls)
             for key, text, *args in rows:
                 value = getattr(getattr(config.value, group), key)
@@ -250,6 +246,9 @@ class Window(W.QMainWindow):
         source_row.addWidget(self.source_label, 1)
         self.requested_fps = label("", "muted")
         source_row.addWidget(self.requested_fps)
+        self._playback_text = ""
+        self.playback_note = label("", "muted")
+        self.playback_note.setStyleSheet("color:#f0ad74;")
         layout.addLayout(source_row)
         self.file_menu = self.menuBar().addMenu("File")
         for title, callback in [
@@ -287,7 +286,7 @@ class Window(W.QMainWindow):
         self.metrics.setToolTip("Acquisition, tracking and recording status")
         metrics_row.addWidget(self.metrics)
         self.reason_label = label("", "metricAlert")
-        metrics_row.addWidget(self.reason_label, 1)
+        metrics_row.addStretch()
         layout.addWidget(metrics_bar)
         split = W.QSplitter(C.Qt.Horizontal)
         layout.addWidget(split, 1)
@@ -365,9 +364,12 @@ class Window(W.QMainWindow):
                 box.hide()
             column.addLayout(header)
             column.addWidget(view, 1)
-            instructions = label(hint, "muted")
-            instructions.setWordWrap(True)
-            column.addWidget(instructions)
+            view.setToolTip(hint)
+            notice = self.reason_label if view is self.eye else self.playback_note
+            notice.setFixedHeight(notice.fontMetrics().height() + 8)
+            notice.setMinimumWidth(0)
+            notice.setSizePolicy(W.QSizePolicy.Ignored, W.QSizePolicy.Fixed)
+            column.addWidget(notice)
             views.addWidget(panel)
             view.action.connect(self.view_action)
         views.setSizes([460, 460])
@@ -570,16 +572,22 @@ class Window(W.QMainWindow):
         self.display_changed(self.display_pause.isChecked())
         add_tooltips(self)
         self.camera_names = {}
-        self.camera_name_discovery = CameraNameDiscovery(self)
-        self.camera_name_discovery.finished.connect(self.camera_names_received)
-        C.QTimer.singleShot(0, self.camera_name_discovery.start)
+        self.camera_discovery = CameraModeDiscovery(self)
+        self.camera_discovery.finished.connect(self.camera_modes_received)
+        C.QTimer.singleShot(0, self.ensure_camera_modes)
         W.QApplication.instance().installEventFilter(self)
 
-    def camera_names_received(self, names):
-        self.camera_names = names
-        selected = self.camera.value()
-        if selected in names and not self.service.run:
-            self.service.config.value.source.camera_name = names[selected]
+    def ensure_camera_modes(self):
+        if self.source_mode() is SourceMode.CAMERA and not self.service.run:
+            self.camera_discovery.ensure_loaded()
+
+    def camera_modes_received(self, cameras, error):
+        self.camera_names = {c['index']: c['name'] for c in cameras}
+        if not self.service.run:
+            from .camera_backend import validated_camera_source
+            source = self.service.config.value.source.model_copy(update={'camera': self.camera.value()})
+            self.service.config.value.source = validated_camera_source(source, cameras)
+            self.camera.setValue(self.service.config.value.source.camera)
 
     def source_mode(self):
         return SourceMode(self.source.currentData())
@@ -611,11 +619,16 @@ class Window(W.QMainWindow):
         now = time.monotonic()
         error = self._error_text if now < self._error_until else ""
         reason = self._reason_text if now < self._reason_until else ""
-        message = error or (f"No valid position: {reason}" if reason else "")
+        message = f"No valid position: {reason}" if reason else ""
         self.reason_label.setToolTip(message)
         self.reason_label.setText(self.reason_label.fontMetrics().elidedText(
             message, C.Qt.ElideRight, max(0, self.reason_label.width() - 8)))
-        self.reason_label.setStyleSheet("color:#ff817f;" if error else "color:#f0ad74;")
+        self.reason_label.setStyleSheet("color:#f0ad74;")
+        message = error or self._playback_text
+        self.playback_note.setToolTip(message)
+        self.playback_note.setText(self.playback_note.fontMetrics().elidedText(
+            message, C.Qt.ElideRight, max(0, self.playback_note.width() - 8)))
+        self.playback_note.setStyleSheet("color:#ff817f;" if error else "color:#f0ad74;")
 
     def display_changed(self, suspended):
         self.display_pause.setText("Resume displays" if suspended else "Suspend displays")
@@ -660,6 +673,14 @@ class Window(W.QMainWindow):
                 self.call("stop")
 
     def start(self):
+        if self.source_mode() is SourceMode.CAMERA:
+            self.ensure_camera_modes()
+            if self.camera_discovery.process is not None:
+                W.QMessageBox.information(self, "Camera modes", "Camera modes are still loading. Start again once discovery finishes.")
+                return
+            from .camera_backend import validated_camera_source
+            source = self.service.config.value.source.model_copy(update={'camera': self.camera.value()})
+            self.service.config.value.source = validated_camera_source(source, self.camera_discovery.cameras or [])
         self.send_parameters()
         config = cfg.MxEyeConfigStore(self.service.config.value.model_copy(deep=True))
         config.value.source.mode = self.source_mode()
@@ -676,6 +697,8 @@ class Window(W.QMainWindow):
         self.call("settings", config=config, callback=lambda: self.call("start"))
 
     def source_controls_changed(self, *args):
+        if hasattr(self, "camera_discovery"):
+            self.ensure_camera_modes()
         video = self.source_mode() is SourceMode.VIDEO
         self.open_button.setVisible(video)
         self.start_button.setVisible(not video)
@@ -987,6 +1010,7 @@ class Window(W.QMainWindow):
                 self.start()
             else:
                 self.pending_video_path = None
+        self.ensure_camera_modes()
         source = self.service.config.value.source
         name = (Path(self.saved_source_path).name if mode is SourceMode.VIDEO
                 else "Simulation" if mode is SourceMode.SIMULATION
@@ -994,16 +1018,44 @@ class Window(W.QMainWindow):
         self.source_label.setText(self.source_label.fontMetrics().elidedText(
             name, C.Qt.ElideMiddle, max(0, self.source_label.width())))
         self.source_label.setToolTip(self.saved_source_path if mode is SourceMode.VIDEO else name)
-        fps = state.source.fps if mode is SourceMode.VIDEO else source.fps
-        self.requested_fps.setText(f"{fps:g} fps" + (" requested" if mode is SourceMode.CAMERA else ""))
+        if mode is SourceMode.VIDEO:
+            median = self.service.video_median_fps
+            self.requested_fps.setText(f"≈ {median:.1f} fps median" if median else "Reading frame timing…")
+            self.requested_fps.setToolTip(
+                "Median of up to 120 recent positive frame intervals from embedded video timestamps. "
+                + self.service.video_timing_info)
+        elif mode is SourceMode.CAMERA:
+            camera = next(
+                (c for c in (self.camera_discovery.cameras or [])
+                 if c["index"] == source.camera),
+                None,
+            )
+            ready = self.camera_discovery.process is None and camera and camera["formats"]
+            self.requested_fps.setText(f"{source.fps:g} fps requested" if ready else "")
+            self.requested_fps.setToolTip(
+                "Request validated against cached advertised modes when available. "
+                "ACQ shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
+        else:
+            self.requested_fps.setText(f"{source.fps:g} fps")
+            self.requested_fps.setToolTip("")
+        info = self.service.playback_info
+        achieved, requested = info.get("achieved"), info.get("requested")
+        limited = (mode is SourceMode.VIDEO and state.state == "running" and not state.paused
+                   and achieved is not None and requested is not None
+                   and abs(requested - self.speed.value()) < 1e-6
+                   and achieved < requested * 0.95 and self.navigation_pending is None)
+        self._playback_text = (f"Playback limited: {achieved:.2f}× achieved / {requested:.2f}× requested"
+                               if limited else self.service.camera_mode_info if mode is SourceMode.CAMERA else "")
         active = state.state in ("running", "starting", "stopping")
         self.start_button.setText("Stop" if active else "Start")
-        self.start_button.setEnabled(not self.pending and state.state != "stopping")
+        self.start_button.setEnabled(not self.pending and state.state != "stopping"
+                                     and (active or mode is not SourceMode.CAMERA or self.camera_discovery.process is None))
         self.source.setEnabled(state.state != "stopping" and not self.pending)
         self.open_button.setEnabled(not self.pending and not self._closing)
         run = self.service.run
         recording = bool(run and run["recording"].is_set())
         draining = bool(run and not recording and not run["writer_done"].is_set())
+        self.record_button.setToolTip(self.service.recording_path_info or "Automatic MKV recording: MJPEG copy or lossless FFV1")
         self.record_button.setText("■ Stop recording" if recording else "Finalizing…" if draining else "● Record")
         self.record_button.setEnabled(state.state == "running" and mode is not SourceMode.VIDEO
                                       and not draining and not self.pending and not state.stats.record_fault)
@@ -1183,12 +1235,16 @@ class Window(W.QMainWindow):
                 self.pupil_method.setCurrentIndex(self.pupil_method.findData(tracking.pupil_method.value))
             self.update_method_controls()
         if payload["frame_id"] != self.last_history_frame:
-            self.history.append((time.monotonic(), r["x"], r["y"]))
+            position_time = payload["media_ns"] / 1e9 if video else time.monotonic()
+            if video and self.history and position_time < self.history[-1][0]:
+                self.history.clear()
+            self.history.append((position_time, r["x"], r["y"]))
             self.last_history_frame = payload["frame_id"]
         if self.history:
             data = np.asarray(self.history)
-            data = data[data[:, 0] > time.monotonic() - 8]
-            times = data[:, 0] - time.monotonic()
+            plot_now = payload["media_ns"] / 1e9 if video else time.monotonic()
+            data = data[data[:, 0] > plot_now - 8]
+            times = data[:, 0] - plot_now
             self.tx.setData(times, data[:, 1], connect="finite")
             self.ty.setData(times, data[:, 2], connect="finite")
             self.trace.setXRange(-8, 0, padding=0)
@@ -1210,7 +1266,7 @@ class Window(W.QMainWindow):
             event.ignore()
             C.QTimer.singleShot(100, self.close)
             return
-        self.camera_name_discovery.stop()
+        self.camera_discovery.stop()
         self.timer.stop()
         self.service.close()
         event.accept()

@@ -102,7 +102,8 @@ def discover():
                 rate = max(float(mode['min_framerate']), float(mode['max_framerate']))
                 code = mode['media_type_str'].removeprefix('MEDIASUBTYPE_').upper()
                 code = {'RGB24': 'BGR3', 'RGB32': 'BGR4', 'YUYV': 'YUY2'}.get(code, code)
-                formats.append(dict(width=width, height=height, fps=rate, fourcc=code))
+                formats.append(dict(width=width, height=height, fps=rate,
+                                    min_fps=min(float(mode['min_framerate']), float(mode['max_framerate'])), fourcc=code))
         except Exception as exc:
             error = str(exc)
         finally:
@@ -194,3 +195,41 @@ def apply_controls(cap, source):
             ok = cap.set(cv2.CAP_PROP_GAIN, gain)
             replies.append(f'gain set={ok}, readback={cap.get(cv2.CAP_PROP_GAIN):g}')
     return '; '.join(replies) or 'Camera exposure/gain unchanged.'
+
+
+def validated_camera_source(source, cameras):
+    """Keep a supported selection; repair stale requests using advertised modes.
+
+    Advertised maxima constrain requests, never prove delivered frame rate.
+    Discovery may be unavailable; manual requests then remain possible.
+    """
+    from .config import SourceConfig
+    camera = next((c for c in cameras if c['index'] == source.camera), None)
+    names = [c for c in cameras if source.camera_name and c['name'] == source.camera_name]
+    if len(names) == 1:
+        camera = names[0]
+    if camera is None:
+        return source.model_copy(deep=True)
+    values = source.model_dump(mode='json')
+    values.update(camera=camera['index'], camera_name=camera['name'], device=camera.get('device', ''))
+    modes = [m for m in camera['formats'] if len(m['fourcc']) == 4 and math.isfinite(m['fps']) and m['fps'] >= 1]
+    if modes:
+        matching = [m for m in modes if (m['width'], m['height']) == (source.width, source.height)]
+        if not matching:
+            fast = [m for m in modes if m['fps'] >= 29]
+            selected = max(fast or modes, key=lambda m: (m['width'] * m['height'], m['fps'], m['fourcc'] == 'MJPG')
+                           if fast else (m['fps'], m['width'] * m['height'], m['fourcc'] == 'MJPG'))
+            matching = [m for m in modes if (m['width'], m['height']) == (selected['width'], selected['height'])]
+        same_format = [m for m in matching if m['fourcc'] == source.fourcc]
+        selected = max(same_format or matching, key=lambda m: (m['fps'], m['fourcc'] == 'MJPG'))
+        rates = [m['fps'] for m in matching if m['fourcc'] == selected['fourcc']]
+        requested = min(source.fps, max(rates))
+        # V4L2 discovery lists discrete intervals; Windows reports a range.
+        if camera.get('backend') == 'v4l2':
+            requested = min(rates, key=lambda rate: abs(rate - requested))
+        else:
+            candidates = [min(m['fps'], max(max(1, m.get('min_fps', 1)), source.fps))
+                          for m in matching if m['fourcc'] == selected['fourcc']]
+            requested = min(candidates, key=lambda rate: abs(rate - source.fps))
+        values.update(width=selected['width'], height=selected['height'], fourcc=selected['fourcc'], fps=requested)
+    return SourceConfig(**values)

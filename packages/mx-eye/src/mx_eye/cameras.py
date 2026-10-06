@@ -15,58 +15,45 @@ def discover_cameras(output):
         output.put(([], str(exc)))
 
 
-def discover_camera_names(output):
-    """Read device names without opening cameras or enumerating capture modes."""
-    try:
-        if sys.platform == "win32":
-            from pygrabber.dshow_graph import FilterGraph
-            names = dict(enumerate(FilterGraph().get_input_devices()))
-        elif sys.platform.startswith("linux"):
-            from pathlib import Path
-            names = {
-                int(path.parent.name[5:]): path.read_text().strip()
-                for path in Path("/sys/class/video4linux").glob("video[0-9]*/name")
-            }
-        else:
-            names = {}
-        output.put(names)
-    except Exception:
-        output.put({})  # Keep saved names / index fallback if discovery is unavailable.
-
-
-class CameraNameDiscovery(C.QObject):
-    finished = C.Signal(object)
+class CameraModeDiscovery(C.QObject):
+    """One asynchronous, session-local mode cache shared by main GUI and Settings."""
+    finished = C.Signal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.cameras = None
+        self.error = ''
         self.process = self.output = None
         self.timer = C.QTimer(self)
         self.timer.timeout.connect(self.poll)
 
-    def start(self):
-        self.stop()
-        context = mp.get_context("spawn")
+    def ensure_loaded(self, force=False):
+        if self.process is not None or (self.cameras is not None and not force):
+            return
+        context = mp.get_context('spawn')
         self.output = context.Queue()
-        self.process = context.Process(target=discover_camera_names,
-                                       args=(self.output,), daemon=True)
+        self.process = context.Process(target=discover_cameras, args=(self.output,), daemon=True)
         try:
             self.process.start()
-        except (OSError, RuntimeError):
-            self.stop()
-            self.finished.emit({})
+        except (OSError, RuntimeError) as exc:
+            self.complete([], str(exc))
             return
         self.started = time.monotonic()
         self.timer.start(100)
 
     def poll(self):
         try:
-            names = self.output.get_nowait()
+            cameras, error = self.output.get_nowait()
         except queue.Empty:
-            if time.monotonic() - self.started < 10 and self.process.is_alive():
+            if time.monotonic() - self.started < 20 and self.process.is_alive():
                 return
-            names = {}
+            cameras, error = [], 'Camera discovery did not finish. Close other camera apps and Refresh, or use manual settings.'
+        self.complete(cameras, error)
+
+    def complete(self, cameras, error=''):
         self.stop()
-        self.finished.emit(names)
+        self.cameras, self.error = cameras, error
+        self.finished.emit(cameras, error)
 
     def stop(self):
         self.timer.stop()
@@ -82,13 +69,14 @@ class CameraNameDiscovery(C.QObject):
 
 
 class CameraControls(W.QWidget):
-    def __init__(self,source,parent=None):
+    def __init__(self,source,parent=None,discovery=None):
         super().__init__(parent)
         self.source=source.model_dump(mode="json")
         source=self.source
         self.cameras=[]
-        self.process=None
-        self.output=None
+        self.owns_discovery = discovery is None
+        self.discovery = discovery or CameraModeDiscovery(self)
+        self.discovery.finished.connect(self.load_modes)
         form=W.QFormLayout(self)
         form.setContentsMargins(0,0,0,0)
         row=W.QHBoxLayout()
@@ -160,35 +148,27 @@ class CameraControls(W.QWidget):
         self.resolution.currentIndexChanged.connect(self.resolution_changed)
         self.format.currentIndexChanged.connect(self.format_changed)
         self.refresh.clicked.connect(self.scan)
-        self.timer=C.QTimer(self)
-        self.timer.timeout.connect(self.poll)
-        C.QTimer.singleShot(0,self.scan)
+        if self.discovery.cameras is not None:
+            self.load_modes(self.discovery.cameras, self.discovery.error)
+        elif parent is None or not getattr(parent.parent(), 'service', None) or not parent.parent().service.run:
+            C.QTimer.singleShot(0, self.discovery.ensure_loaded)
+        else:
+            self.info.setText('Stop tracking to discover camera modes.')
+
+    @property
+    def process(self):
+        return self.discovery.process
 
     def scan(self):
-        self.stop_scan()
-        self.refresh.setEnabled(False)
-        self.camera.setEnabled(False)
-        self.resolution.setEnabled(False)
-        self.format.setEnabled(False)
         self.info.setText('Scanning connected cameras…')
-        context=mp.get_context('spawn')
-        self.output=context.Queue()
-        self.process=context.Process(target=discover_cameras,args=(self.output,),daemon=True)
-        self.process.start()
-        self.started=time.monotonic()
-        self.timer.start(100)
+        self.discovery.ensure_loaded(force=True)
 
-    def poll(self):
-        try:
-            cameras,error=self.output.get_nowait()
-        except queue.Empty:
-            if time.monotonic()-self.started<20 and self.process.is_alive(): return
-            cameras,error=[],'Camera discovery did not finish. Close other camera apps and refresh, or use manual settings.'
+    def load_modes(self, cameras, error):
+        if self.cameras:
+            self.source = self.values().model_dump(mode="json")
         selected=self.camera.currentData()
         previous=next((item for item in self.cameras if item['index']==selected),None)
         selected_name=previous['name'] if previous else self.source.get('camera_name','')
-        selected_size=self.resolution.currentData()
-        self.stop_scan()
         self.refresh.setEnabled(True)
         self.camera.setEnabled(True)
         self.resolution.setEnabled(True)
@@ -208,8 +188,12 @@ class CameraControls(W.QWidget):
                 self.camera.addItem(f"{camera['name']} · {camera['index']}",camera['index'])
             matches=[i for i,item in enumerate(cameras) if item['name']==selected_name]
             self.camera.setCurrentIndex(matches[0] if len(matches)==1 else max(0,self.camera.findData(selected)))
-        current=cameras[self.camera.currentIndex()]
-        self.camera_changed(preferred=selected_size if current['name']==selected_name else None)
+        from .camera_backend import validated_camera_source
+        validated = validated_camera_source(SourceConfig(**self.source), cameras)
+        self.source = validated.model_dump(mode='json')
+        with C.QSignalBlocker(self.camera):
+            self.camera.setCurrentIndex(max(0, self.camera.findData(validated.camera)))
+        self.camera_changed(preferred=(validated.width, validated.height))
 
     def camera_changed(self,*args,preferred=None):
         camera=next((item for item in self.cameras if item['index']==self.camera.currentData()),None)
@@ -222,7 +206,7 @@ class CameraControls(W.QWidget):
         exposure_limits=next((controls[n] for n in ('exposure_time_absolute','exposure_absolute') if n in controls),{})
         self.exposure.setRange(max(.01,exposure_limits.get('min',1)/10),min(1000,exposure_limits.get('max',10000)/10))
         self.exposure.setSingleStep(max(.01,exposure_limits.get('step',10)/10))
-        self.backend.setCurrentText(camera.get('backend', 'auto'))
+        self.backend.setCurrentText(self.source['backend'] if preferred is not None else camera.get('backend', 'auto'))
         usable=[m for m in camera['formats'] if len(m['fourcc'])==4]
         modes=usable or camera['formats']
         sizes=sorted({(m['width'],m['height']) for m in modes},key=lambda s:(s[0]*s[1],s[0]),reverse=True)
@@ -234,7 +218,7 @@ class CameraControls(W.QWidget):
         with C.QSignalBlocker(self.resolution):
             self.resolution.clear()
             for w,h in sizes: self.resolution.addItem(f'{w} × {h}',(w,h))
-            if preferred is not None and tuple(preferred) in fast_sizes:
+            if preferred is not None and tuple(preferred) in sizes:
                 self.resolution.setCurrentIndex(sizes.index(tuple(preferred)))
             elif default_size is not None:
                 self.resolution.setCurrentIndex(sizes.index(default_size))
@@ -242,9 +226,9 @@ class CameraControls(W.QWidget):
         self.info.setText('Highest resolution reporting at least 29 fps selected.' if fast_sizes else
                           ('No mode reports 29 fps; fastest reported mode selected.' if sizes else
                            'This camera did not report its modes. Use manual settings. '+camera['error']))
-        self.resolution_changed()
+        self.resolution_changed(preserve=preferred is not None)
 
-    def resolution_changed(self):
+    def resolution_changed(self, *args, preserve=False):
         size=self.resolution.currentData()
         if not size: return
         self.width.setValue(size[0])
@@ -259,38 +243,47 @@ class CameraControls(W.QWidget):
             for mode in usable:
                 code=mode['fourcc']
                 if code not in by_format or mode['fps']>by_format[code]['fps']:
-                    by_format[code]=mode
+                    by_format[code]=dict(mode)
+            for code, mode in by_format.items():
+                mode['min_fps'] = min(max(1, m.get('min_fps', 1)) for m in usable if m['fourcc'] == code)
             options=sorted(by_format.values(),key=lambda m:(m['fps'],m['fourcc']=='MJPG'),reverse=True)
             with C.QSignalBlocker(self.format):
                 for mode in options:
                     self.format.addItem(f"{mode['fourcc']} · up to {mode['fps']:g} fps",mode)
             self.format.setEnabled(bool(options))
             self.manual.setVisible(not options)
+            if preserve:
+                index = next((i for i, mode in enumerate(options) if mode['fourcc'] == self.source['fourcc']), 0)
+                with C.QSignalBlocker(self.format):
+                    self.format.setCurrentIndex(index)
             self.format_changed()
+            if preserve:
+                self.fps.setValue(self.source['fps'])
 
     def format_changed(self):
         mode=self.format.currentData()
         if not mode: return
         self.fourcc.setText(mode['fourcc'])
+        self.fps.setRange(max(1, mode.get('min_fps', 1)), max(1, mode['fps']))
         self.fps.setValue(max(1,mode['fps']))
         self.info.setText(f"{mode['width']} × {mode['height']} · {mode['fourcc']} · driver reports up to {mode['fps']:.1f} fps. Check measured ACQ after starting.")
 
     def values(self):
         camera=next((item for item in self.cameras if item['index']==self.index.value()),None)
-        return SourceConfig(**dict(self.source, camera=self.index.value(),width=self.width.value(),height=self.height.value(),
+        source = SourceConfig(**dict(self.source, camera=self.index.value(),width=self.width.value(),height=self.height.value(),
                     camera_name=camera['name'] if camera else self.source.get('camera_name',''),
                     device=camera.get('device','') if camera else
                            (self.source.get('device','') if self.index.value() == self.source['camera'] else ''),
                     exposure_mode=self.exposure_mode.currentData(),exposure_ms=self.exposure.value(),
                     gain=self.gain.value() if self.gain_on.isChecked() else None,
                     fps=self.fps.value(),backend=self.backend.currentText(),fourcc=self.fourcc.text().strip()))
+        from .camera_backend import validated_camera_source
+        return validated_camera_source(source, self.cameras)
 
     def stop_scan(self):
-        self.timer.stop()
-        if self.process is not None:
-            if self.process.is_alive(): self.process.terminate()
-            self.process.join(timeout=.5)
-            self.process=None
-        if self.output is not None:
-            self.output.close()
-            self.output=None
+        if self.owns_discovery:
+            self.discovery.stop()
+        try:
+            self.discovery.finished.disconnect(self.load_modes)
+        except (RuntimeError, TypeError):
+            pass

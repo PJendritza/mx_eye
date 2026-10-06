@@ -36,8 +36,8 @@ and provenance. The workspace members live in `packages/mx-eye`,
   resolution with a reported mode of at least 29 fps, or the fastest reported
   mode if none qualifies. Choose a resolution and camera format (for example,
   MJPG or YUY2) separately; the requested FPS starts at that format's reported
-  maximum. The source line shows the format and FPS reported by the opened camera,
-  while ACQ shows the measured rate. Discovery runs in a
+  maximum. The source line labels the configured FPS as requested,
+  while ACQ shows the measured frame-delivery rate. OpenCV FPS readback is not a verified camera rate. Discovery runs in a
   separate process and is available while tracking is stopped. If enumeration is
   unavailable, manual settings remain available. Other operating systems currently
   use manual camera settings. The Windows dependency comes from the `gui` extra
@@ -73,7 +73,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
 - **Video layout:** equally sized eye-detail (left) and source (right) panels.
   Pupil/CR mask switches and Centers sit above eye detail. Template size and Template inset above
   the source independently toggle the template-radius circle and small template
-  preview. Click instructions stay below each video. Slider values sit beside
+  preview. Fixed-height warning rows stay below each video; click instructions are tooltips. Slider values sit beside
   their sliders in compact, collapsible groups.
 - **Configuration:** Save/Load JSON also preserves these display switches.
   Configurations include the template image. The file is a `format: "mx-eye"`,
@@ -133,15 +133,16 @@ Each recording gets a unique subfolder under the configured output directory:
 
 | File | Contents |
 |---|---|
-| `video.avi` | MJPG full-frame video; fast, lossy compression, no overlays |
-| `video.mkv` | Alternative FFV1 lossless full-frame video; more CPU demand |
+| `video.mkv` | Timestamped original MJPEG packets, or lossless FFV1 for decoded frames; no overlays |
 | `frames.csv` | Video index, acquired source-frame ID, shared wall-clock acquisition timestamp, media time |
 | `tracking.csv` | Every locally logged tracking sample, with timestamps, coordinates and flags |
 | `config.json` | Configuration at session start |
 | `session.json` | Final counts, completion status and any detected fault |
 
-`frames.csv` is the timing authority. Video containers use a nominal constant FPS;
-actual camera frame intervals may vary. Frame IDs connect video to tracking rows.
+`video.mkv` embeds acquisition-relative monotonic timestamps. `frames.csv` also
+stores full-resolution monotonic and synchronized wall-clock acquisition times.
+Playback uses embedded video timestamps; it never reads the CSV. Frame IDs connect
+video to tracking rows.
 Parameter adjustments during acquisition affect tracking.csv; config.json records
 settings at recording start only. Save the final configuration separately if needed.
 
@@ -158,8 +159,9 @@ A hung camera is forcibly stopped after 5 seconds; hung tracking/writing after
 30 seconds. Forced termination marks the session incomplete. After abrupt power
 loss, a missing session.json must also be treated as an incomplete session.
 
-Completion checks compare acquired/enqueued/written counts and reopen the video
-container to check readability and reported frame count. This is not a full
+Completion checks compare recording-acquired/enqueued/written counts and reopen
+the video to check readability. VFR header frame-count estimates are not used to
+declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside
 the camera or USB driver. `tracking_log_complete` separately reports log overflow.
 
@@ -385,3 +387,29 @@ longer tracking session. Stop tracking also ends and drains an active recording.
 The internal recording count is excluded from the public protocol statistics.
 The old record_simulation configuration field is accepted for compatibility but
 no longer starts recording automatically.
+
+## Video timing
+
+PyAV handles timestamp-aware MKV muxing and video decoding. MJPEG copying is used
+only when capture exposes original JPEG packets; otherwise FFV1 preserves the
+supplied BGR pixels (bgr0 encoding). No CSV playback fallback or old-file repair.
+The shared recording ring adds monotonic acquisition time; tracking payload and
+tracking CSV remain unchanged. Playback timing is separate from live acquisition
+and network timestamps, and the GUI trace uses media time for video sources.
+Playback warnings use source-time advancement / monotonic elapsed time over two
+seconds, reset on pause, seek or speed changes, with a 95% threshold. Codec fields
+in old configurations are accepted but ignored. Pi recording throughput versus a
+standalone 60-FPS application remains a separate follow-up.
+
+Video FPS in the GUI is estimated from the median of up to 120 recent positive
+embedded timestamp intervals, independent of playback speed. Eye tracking
+rejections appear beneath eye detail; playback and session faults appear beneath
+the source view. Both rows remain allocated when empty, avoiding layout movement.
+The camera label always identifies the configured request; ACQ is measured host
+frame delivery. A process-local CameraModeDiscovery cache is shared by Window and
+Settings, populated on startup/selection of Camera or on first Settings access.
+Explicit Refresh rescans; switching sources or reopening Settings reuses the cache.
+Supported saved resolution/format/FPS selections survive Settings. Invalid requests
+are repaired from advertised modes before Start; missing discovery leaves manual
+requests available. Capture reports rejected property requests and dimension/format
+mismatches beneath the source view. Mode discovery never runs during tracking.

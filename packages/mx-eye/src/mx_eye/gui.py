@@ -327,9 +327,11 @@ class Window(W.QMainWindow):
         self.eye = EyeView(crop=True)
         self.simulation_model = None
         self.full.simulation_context = self.simulation_context
+        self.eye.simulation_context = self.simulation_context
         self.manipulate_simulation = W.QCheckBox("Manipulate simulation")
+        self._simulation_ctrl_checked = None
         self.manipulate_simulation.setChecked(True)
-        self.manipulate_simulation.setToolTip("Move the simulated face/pupils and trigger blinks in the source view. Turn off to edit ROI and templates normally.")
+        self.manipulate_simulation.setToolTip("Manipulate the simulation in both views. Uncheck, or hold Ctrl temporarily, for normal pupil/CR selection and ROI/template controls.")
         self.manipulate_simulation.toggled.connect(self.update_simulation_controls)
 
         def toggle(text, key, default=True, color=None):
@@ -709,13 +711,15 @@ class Window(W.QMainWindow):
     def update_simulation_controls(self, *args):
         simulation = self.source_mode() is SourceMode.SIMULATION
         self.manipulate_simulation.setVisible(simulation)
-        self.full.simulation_drag = None
-        self.full.drag = None
-        self.full.drag_preview = None
-        self.full.update()
+        for view in (self.full, self.eye):
+            view.simulation_drag = None
+            view.drag = None
+            view.drag_preview = None
+            view.update()
         self.full.setToolTip(SIMULATION_HINT if simulation and self.manipulate_simulation.isChecked()
                              else "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom")
-        self.eye.setToolTip("Left-click pupil · Right-click CR · Shift-click template")
+        self.eye.setToolTip(SIMULATION_HINT if simulation and self.manipulate_simulation.isChecked()
+                            else "Left-click pupil · Right-click CR · Shift-click template")
 
     def simulation_context(self):
         if not self.manipulate_simulation.isChecked() or self.source_mode() is not SourceMode.SIMULATION:
@@ -841,7 +845,29 @@ class Window(W.QMainWindow):
         else:
             self.call(command, **args)
 
+    def set_simulation_control_override(self, active):
+        if active and self._simulation_ctrl_checked is None:
+            self._simulation_ctrl_checked = self.manipulate_simulation.isChecked()
+            self.manipulate_simulation.setChecked(False)
+            self.manipulate_simulation.setEnabled(False)
+        elif not active and self._simulation_ctrl_checked is not None:
+            previous = self._simulation_ctrl_checked
+            self._simulation_ctrl_checked = None
+            self.manipulate_simulation.setEnabled(True)
+            self.manipulate_simulation.setChecked(previous)
+
     def eventFilter(self, watched, event):
+        if event.type() in (C.QEvent.KeyPress, C.QEvent.KeyRelease) and event.key() == C.Qt.Key_Control:
+            if not event.isAutoRepeat():
+                if event.type() == C.QEvent.KeyRelease:
+                    self.set_simulation_control_override(False)
+                elif self.isActiveWindow() and self.source_mode() is SourceMode.SIMULATION:
+                    self.set_simulation_control_override(True)
+        elif event.type() == C.QEvent.ApplicationDeactivate or (
+            watched is self and event.type() == C.QEvent.WindowDeactivate
+        ):
+            self.set_simulation_control_override(False)
+
         if event.type() == C.QEvent.KeyPress and event.key() in (
             C.Qt.Key_Left,
             C.Qt.Key_Right,

@@ -327,7 +327,10 @@ class Window(W.QMainWindow):
         self.eye = EyeView(crop=True)
         self.simulation_model = None
         self.full.simulation_context = self.simulation_context
-        self.eye.simulation_context = self.simulation_context
+        self.manipulate_simulation = W.QCheckBox("Manipulate simulation")
+        self.manipulate_simulation.setChecked(True)
+        self.manipulate_simulation.setToolTip("Move the simulated face/pupils and trigger blinks in the source view. Turn off to edit ROI and templates normally.")
+        self.manipulate_simulation.toggled.connect(self.update_simulation_controls)
 
         def toggle(text, key, default=True, color=None):
             box = W.QCheckBox(text)
@@ -359,6 +362,8 @@ class Window(W.QMainWindow):
             header = W.QHBoxLayout()
             header.addWidget(label(title, "muted"))
             header.addStretch()
+            if view is self.full:
+                header.addWidget(self.manipulate_simulation)
             for box in (
                 (self.pupil_mask, self.cr_mask, self.crosshairs)
                 if view is self.eye
@@ -368,7 +373,7 @@ class Window(W.QMainWindow):
                 box.hide()
             column.addLayout(header)
             column.addWidget(view, 1)
-            view.setToolTip(SIMULATION_HINT if self.source_mode() is SourceMode.SIMULATION else hint)
+            view.setToolTip(hint)
             notice = self.reason_label if view is self.eye else self.playback_note
             notice.setFixedHeight(notice.fontMetrics().height() + 8)
             notice.setMinimumWidth(0)
@@ -376,6 +381,7 @@ class Window(W.QMainWindow):
             column.addWidget(notice)
             views.addWidget(panel)
             view.action.connect(self.view_action)
+        self.update_simulation_controls()
         views.setSizes([460, 460])
         vertical.addWidget(views)
         plot_panel = W.QWidget()
@@ -700,7 +706,20 @@ class Window(W.QMainWindow):
         config.value.tracking.template_tracking = self.template_on.isChecked()
         self.call("settings", config=config, callback=lambda: self.call("start"))
 
+    def update_simulation_controls(self, *args):
+        simulation = self.source_mode() is SourceMode.SIMULATION
+        self.manipulate_simulation.setVisible(simulation)
+        self.full.simulation_drag = None
+        self.full.drag = None
+        self.full.drag_preview = None
+        self.full.update()
+        self.full.setToolTip(SIMULATION_HINT if simulation and self.manipulate_simulation.isChecked()
+                             else "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom")
+        self.eye.setToolTip("Left-click pupil · Right-click CR · Shift-click template")
+
     def simulation_context(self):
+        if not self.manipulate_simulation.isChecked() or self.source_mode() is not SourceMode.SIMULATION:
+            return None
         run = self.service.run
         if not run or run.get("simulation") is None:
             return None
@@ -715,10 +734,8 @@ class Window(W.QMainWindow):
         if hasattr(self, "camera_discovery"):
             self.ensure_camera_modes()
         video = self.source_mode() is SourceMode.VIDEO
-        if hasattr(self, "full"):
-            for view, normal in ((self.full, "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom"),
-                                 (self.eye, "Left-click pupil · Right-click CR · Shift-click template")):
-                view.setToolTip(SIMULATION_HINT if self.source_mode() is SourceMode.SIMULATION else normal)
+        if hasattr(self, "manipulate_simulation"):
+            self.update_simulation_controls()
         self.open_button.setVisible(video)
         self.start_button.setVisible(not video)
         self.record_button.setEnabled(False)

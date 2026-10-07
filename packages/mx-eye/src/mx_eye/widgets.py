@@ -452,7 +452,7 @@ class EyeView(W.QWidget):
         if p is None:
             return
         shift = bool(event.modifiers() & C.Qt.ShiftModifier)
-        context = self.simulation_context() if self.simulation_context else None
+        context = self.simulation_context() if not self.crop and self.simulation_context else None
         if context and shift and not event.modifiers() & C.Qt.ControlModifier:
             self.action.emit("template", dict(point=p))
             return

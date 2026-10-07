@@ -68,9 +68,15 @@ def test_simulation_gestures_keep_tracking_controls_available(monkeypatch, crop)
         view.show()
         app.processEvents()
         QtTest.QTest.mouseClick(view, C.Qt.LeftButton, pos=C.QPoint(163, 120))
-        assert actions[-1] == ('simulation', {'gesture': 'gaze', 'position': (3, 0)})
+        if crop:
+            assert actions[-1] == ('pick', {'kind': 'pupil', 'point': (163, 120)})
+        else:
+            assert actions[-1] == ('simulation', {'gesture': 'gaze', 'position': (3, 0)})
         QtTest.QTest.mouseClick(view, C.Qt.RightButton, pos=C.QPoint(160, 120))
-        assert actions[-1] == ('simulation', {'gesture': 'blink'})
+        if crop:
+            assert actions[-1] == ('pick', {'kind': 'cr', 'point': (160, 120)})
+        else:
+            assert actions[-1] == ('simulation', {'gesture': 'blink'})
         QtTest.QTest.mouseClick(view, C.Qt.RightButton, C.Qt.ControlModifier, C.QPoint(165, 116))
         if crop:
             assert actions[-1][0] == 'pick' and actions[-1][1]['kind'] == 'cr'
@@ -80,7 +86,11 @@ def test_simulation_gestures_keep_tracking_controls_available(monkeypatch, crop)
         assert actions[-1][0] == 'template'
         QtTest.QTest.mousePress(view, C.Qt.LeftButton, pos=C.QPoint(260, 210))
         QtTest.QTest.mouseRelease(view, C.Qt.LeftButton, pos=C.QPoint(280, 220))
-        assert actions[-1] == ('simulation', {'gesture': 'head', 'position': (20, 10)})
+        if not crop:
+            assert actions[-1] == ('simulation', {'gesture': 'head', 'position': (20, 10)})
+        view.simulation_context = lambda: None  # Manipulation switched off.
+        QtTest.QTest.mouseClick(view, C.Qt.RightButton, pos=C.QPoint(160, 120))
+        assert actions[-1][0] == ('pick' if crop else 'template')
     finally:
         view.close()
         view.deleteLater()

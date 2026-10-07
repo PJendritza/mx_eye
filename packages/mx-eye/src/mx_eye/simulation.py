@@ -7,7 +7,7 @@ import numpy as np
 
 
 SIMULATION_HINT = (
-    "Simulation: left-click/drag inside an eye moves pupils; drag elsewhere moves "
+    "Source view with Manipulate simulation enabled: left-click/drag inside an eye moves pupils; drag elsewhere moves "
     "the face; right-click blinks for 350 ms. Shift-click captures a template. "
     "Hold Ctrl for normal pupil/CR picking and ROI/search-window dragging."
 )

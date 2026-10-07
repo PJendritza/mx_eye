@@ -165,7 +165,12 @@ pupils, corneal reflections and distinct, stable markings for template tracking.
 The left eye starts inside the default ROI. Frames use the normal acquisition,
 tracking, preview, transmission and optional recording paths.
 
-| Gesture in either video view | Action |
+**Manipulate simulation** is enabled by default and appears only in Simulation
+mode above the source view. The eye-detail view always keeps normal pupil/CR
+selection and threshold estimation. Turn the toggle off to use normal ROI and
+template controls in the source view; tracking continues in either mode.
+
+| Gesture in source view with manipulation enabled | Action |
 |---|---|
 | Left-click inside an eye | Saccade: move both pupils to the corresponding gaze position |
 | Left-drag inside an eye | Move pupils continuously, independently of the face and CRs |

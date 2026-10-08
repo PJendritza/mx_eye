@@ -2,52 +2,51 @@
   "format": "mx-eye",
   "version": "1.0.0",
   "source": {
-    "mode": "camera",
+    "mode": "simulation",
     "camera": 0,
-    "path": "",
-    "width": 640,
-    "height": 480,
-    "fps": 120.0,
-    "backend": "auto",
-    "fourcc": "MJPG",
-    "speed": 1.0,
-    "camera_name": "",
+    "camera_name": "HD Pro Webcam C920",
     "device": "",
     "exposure_mode": "unchanged",
     "exposure_ms": 7.8125,
-    "gain": null
+    "path": "C:/Users/patri/Videos/idd_mxbi_videos/b_mxbi_2026-09-30_15-18-24.mkv",
+    "width": 640,
+    "height": 480,
+    "fps": 30.00003000003,
+    "backend": "auto",
+    "fourcc": "MJPG",
+    "speed": 1.0
   },
   "tracking": {
-    "pupil_thr": 48,
-    "pupil_min": 30,
-    "pupil_max": 3000,
-    "cr_thr": 181,
-    "cr_min": 2,
-    "cr_max": 120,
-    "pupil_gate": 7.0,
-    "cr_gate": 2.0,
-    "max_pair_dist": 10.0,
-    "max_pair_vec_change": 4.0,
-    "reacquire_after_frames": 4,
-    "template_radius": 35,
-    "template_search_size": 520,
-    "template_min_corr": 0.6,
-    "tracking_mode": "Pupil + CR",
-    "pupil_coordinates": "absolute",
-    "template_tracking": false,
-    "roi": [
-      0.0,
-      0.0,
-      320.0,
-      240.0
-    ],
     "pupil_method": "threshold",
     "pupil_rays": 48,
     "pupil_edge_contrast": 8,
     "pupil_edge_threshold": 30,
     "pupil_fit_error": 2.5,
     "pupil_adaptive_window": 61,
-    "pupil_adaptive_offset": 7
+    "pupil_adaptive_offset": 7,
+    "pupil_thr": 93,
+    "pupil_min": 30,
+    "pupil_max": 3000,
+    "cr_thr": 181,
+    "cr_min": 2,
+    "cr_max": 120,
+    "pupil_gate": 55.0,
+    "cr_gate": 52.0,
+    "max_pair_dist": 86.0,
+    "max_pair_vec_change": 53.0,
+    "reacquire_after_frames": 33,
+    "template_radius": 35,
+    "template_search_size": 600,
+    "template_min_corr": 0.6,
+    "tracking_mode": "Pupil + CR",
+    "pupil_coordinates": "absolute",
+    "template_tracking": true,
+    "roi": [
+      389.0,
+      128.0,
+      112.0,
+      110.0
+    ]
   },
   "network": {
     "bind": "127.0.0.1",
@@ -65,8 +64,37 @@
     "hz": 25.0,
     "masks": true,
     "crosshairs": true,
+    "pupil_mask": true,
+    "cr_mask": true,
+    "template_circle": true,
+    "template_inset": true,
     "rejection_reason": true,
     "suspended": false
   },
-  "template": null
+  "template": {
+    "png": "iVBORw0KGgoAAAANSUhEUgAAAEcAAABHCAAAAABw2wXDAAACHElEQVRYCa3BywnjQBBF0fvoLLybXATadgYDBc6vt4bKRTtnUTCy/JOtbsm25hwZm4Y/bJLRNPDmD00y6gZqjk6djIqBhiPgVMhYGGg6cuEsyHgzsOLIlfNGxquBNUdunFcy5gbWHXlw5mTMDGw48uTMyHga2HJkxnmS8dCd+EjPjfMg4y74XM/EuZNxE3ynZ+TcyLgKvtYDzpWMSfCLHpyJjEnwm96ZyLgIftU7FzJGwQ6JkYxRsENiJAOCXRIgA4JdEiCDYKcEMgh2SiCDYKcEMoKGwlVmS0JGUFV4yqxLyAgqCq8yaxKyoKIwdz5AZk2SBUuFuTMcILMiyYKlwsyZ0QEybUkWLBRenOEAZNqSLFgovDofGGXakixYKFRlmpIsWChUZZqSLFgoVGWakv5SUajJtMmCpUJFpi3JgqVCRaYtyYKKwlKmLcmCmsK7zIokC6oKrzJrkixoKDxl1iVZ0FaYZLYkWfAfJBnBbgkZwW4JGcFuCRkEOyWQQbBTAhkEu/Q4yIDgdz04IAOCn/WAAzJGwW96Rs5Ixij4Rc/EGcm46E58q+fKuZAx6TjxhZ47ZyJj0jE68ZGeGWci46rj5sSKnjfOlYybjrkTb3pqnBsZdx1fc+5kPHR8yXmQ8dTxFedJxkzHF5wZGXMdH3PmZLzq+IjzSsabjg84b2QsdGxwFmRUdKxwKmTUdVQ5dTKaOt44TTI2dc6mfwHzknOYc5iwAAAAAElFTkSuQmCC",
+    "anchor": [
+      623.1185770750989,
+      327.9407114624506
+    ],
+    "center": [
+      445.0,
+      184.0
+    ]
+  },
+  "calibration": {
+    "format": "mx-eye-calibration",
+    "version": "1.1.0",
+    "calibration_id": "79bb3c93-93f0-4bfa-bc7e-d1646becae17",
+    "created_at": "2026-10-08T12:38:14.555654Z",
+    "animal_id": "default",
+    "screen_width": 1024,
+    "screen_height": 600,
+    "input_coordinate_system": "pupil_minus_cr",
+    "offset_x": -1.0,
+    "offset_y": 1.0,
+    "gain_x": -25.0,
+    "gain_y": 25.0,
+    "rotation_deg": 0.0
+  }
 }

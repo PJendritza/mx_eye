@@ -15,6 +15,10 @@ from pydantic import (
     model_validator,
 )
 
+from ..calibration import CalibrationProfile
+
+_UNCHANGED = object()
+
 
 class ConfigFormat(StrEnum):
     MX_EYE = "mx-eye"
@@ -172,19 +176,29 @@ class MxEyeConfigModel(ConfigModel):
     recording: RecordingConfig = Field(default_factory=RecordingConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     template: TemplateConfig | None = None
+    calibration: CalibrationProfile | None = None
 
 
 class MxEyeConfigStore:
-    def __init__(self, value: MxEyeConfigModel | None = None) -> None:
+    def __init__(
+        self, value: MxEyeConfigModel | None = None, path: Path | None = None
+    ) -> None:
         self._config = value or MxEyeConfigModel()
+        self.path = path
 
     @property
     def value(self) -> MxEyeConfigModel:
         return self._config
 
-    def replace(self, value: MxEyeConfigModel) -> None:
+    def replace(
+        self,
+        value: MxEyeConfigModel,
+        path: Path | None | object = _UNCHANGED,
+    ) -> None:
         """Adopt another model so a shared store keeps its identity."""
         self._config = value.model_copy(deep=True)
+        if path is not _UNCHANGED:
+            self.path = path  # type: ignore[assignment]
 
     @classmethod
     def defaults(cls) -> Self:
@@ -209,7 +223,7 @@ class MxEyeConfigStore:
             if isinstance(network, dict):
                 raw["network"] = {key: value for key, value in network.items()
                                   if key != "sync_port"}
-        return cls(MxEyeConfigModel.model_validate(raw))
+        return cls(MxEyeConfigModel.model_validate(raw), path)
 
     def save(self, path: Path) -> None:
         path = self._check_path(path)
@@ -224,6 +238,11 @@ class MxEyeConfigStore:
             encoding="utf-8",
         )
         temp.replace(path)
+
+    def save_persistent(self) -> None:
+        """Save to the startup configuration path when one is configured."""
+        if self.path is not None:
+            self.save(self.path)
 
 
 _shared: MxEyeConfigStore | None = None
@@ -243,6 +262,6 @@ def store() -> MxEyeConfigStore:
 
 def configure(path: Path | None = None) -> MxEyeConfigStore:
     """Load a configuration file, or the defaults, into the shared store."""
-    value = MxEyeConfigStore.load(path).value if path else MxEyeConfigModel()
-    store().replace(value)
+    loaded = MxEyeConfigStore.load(path) if path else MxEyeConfigStore()
+    store().replace(loaded.value, loaded.path)
     return store()

@@ -140,6 +140,20 @@ def test_save_and_load_round_trip(tmp_path):
     assert not path.with_suffix(".json.tmp").exists()
 
 
+def test_persistent_path_saves_current_configuration(tmp_path):
+    path = tmp_path / "mx_eye_data" / "config.json"
+    config = cfg.MxEyeConfigStore(path=path)
+    config.value.tracking.roi = (12, 34, 200, 150)
+    config.value.tracking.pupil_gate = 19
+
+    config.save_persistent()
+
+    loaded = cfg.MxEyeConfigStore.load(path)
+    assert loaded.value.tracking.roi == (12, 34, 200, 150)
+    assert loaded.value.tracking.pupil_gate == 19
+    assert loaded.path == path
+
+
 def test_shared_store_is_a_process_singleton():
     shared = cfg.store()
 

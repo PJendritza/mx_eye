@@ -4,6 +4,7 @@ import time
 
 import pytest
 from mx_eye import config as cfg
+from mx_eye.calibration import CalibrationProfile
 from mx_eye.service import Service
 from mx_eye_protocol import TrackingFlags
 from py_mx_eye import MxEye, MxEyeConfig
@@ -14,6 +15,7 @@ def test_simulation_control_data_and_restart(tmp_path):
     config = cfg.MxEyeConfigStore.defaults()
     config.value.source.mode = cfg.SourceMode.SIMULATION
     config.value.source.fps = 30
+    config.value.calibration = CalibrationProfile(animal_id="simulation")
     config.value.recording.directory = str(tmp_path)
     config.value.network.data_port = _free_port()
     config.value.network.control_port = _free_port()
@@ -33,8 +35,16 @@ def test_simulation_control_data_and_restart(tmp_path):
             status = eye.start()
             assert status.state == "running"
             sample = next(eye.read(timeout=3, max_age_ms=None, require_valid=False))
+            deadline = time.monotonic() + 3
+            while not sample.frame.flags & TrackingFlags.CALIBRATED:
+                if time.monotonic() >= deadline:
+                    pytest.fail("Simulation did not produce calibrated output")
+                sample = next(
+                    eye.read(timeout=1, max_age_ms=None, require_valid=False)
+                )
             assert sample.frame.frame_size == 97
             assert sample.frame.flags & TrackingFlags.SIMULATION
+            assert sample.frame.coordinate_system == "screen_pixels"
             assert sample.frame.session == status.session
             sessions.append(status.session)
             assert eye.stop().state in {"stopping", "idle"}

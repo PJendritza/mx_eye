@@ -109,7 +109,9 @@ Stop may return `stopping`; query status for completion. Control timeouts raise
 Update tracker and SDK together. Raw TCP/UDP, the old frame header, and the
 `transport`, `udp_host`, and `udp_bind` settings have been removed; remove these
 keys from saved configurations. Host/bind and the two port settings remain.
-Coordinates are uncalibrated source-image pixels. A runnable example:
+Coordinates are uncalibrated source-image pixels unless an active manual
+calibration marks `x`/`y` as top-left-origin screen pixels. Raw pupil and
+corneal-reflection feature coordinates remain in every packet. A runnable example:
 `uv run python -m mx_eye_client.receive_minimal`. More detail in AGENTS.md.
 
 ### GUI controls
@@ -128,8 +130,17 @@ finish before starting another recording. Recording is disabled for file playbac
 **Tools → Timing / performance diagnostics** displays existing rates, latest
 tracking-loop duration, skipped frames, send errors, buffer backlog, and GUI timing.
 GUI callback timing is collected only while the diagnostics window is visible.
-Detailed per-stage profiling and calibration tools are planned separately;
-Calibration is currently a menu placeholder.
+
+**Calibration → Open calibration workspace** opens a separate live screen-space
+trace with selectable history and manual X/Y offset, gain and rotation.
+Profiles are versioned per animal in the visible mx_eye data directory; the
+latest active profile is restored at startup and copied into recording
+`config.json` snapshots. Saving never overwrites an older profile.
+
+When run from this source checkout, persistent settings and calibrations default
+to the sibling `mx_eye_data` directory. Use `mx-eye --data-dir PATH` or set
+`MX_EYE_DATA_DIR` to choose another location. The complete current configuration,
+including tracking parameters and ROI, is saved when the application closes.
 
 ### Timestamped recording and playback
 

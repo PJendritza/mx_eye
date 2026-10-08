@@ -21,6 +21,7 @@ class TrackingFlags(IntFlag):
     ROI_RELATIVE = (
         auto()
     )  # Pupil-only x/y use the ROI origin instead of the image origin.
+    CALIBRATED = auto()  # Output x/y are calibrated screen pixels.
 
 
 # Tracking wire order: every payload field with its struct code, in byte order.
@@ -58,8 +59,10 @@ class DataFrame(BaseModel):
     Timestamps except media_ns are nanoseconds from the shared wall clock
     (CLOCK_REALTIME, Unix epoch), aligned between hosts by system-level NTP or
     PTP; they are not a monotonic uptime clock. media_ns is a media position.
-    Coordinates are uncalibrated source-image pixels: x rightward, y downward.
-    Missing detections and invalid output coordinates are represented by NaN.
+    Coordinates are normally uncalibrated source-image pixels. When CALIBRATED
+    is set, x/y are top-left-origin screen pixels while pupil_x/pupil_y and
+    cr_x/cr_y remain raw full-image feature coordinates. Missing detections and
+    invalid output coordinates are represented by NaN.
 
     Field order is the wire order; the declared types decode a payload, so for
     example the raw flags byte becomes a TrackingFlags member.
@@ -98,6 +101,8 @@ class DataFrame(BaseModel):
 
     @property
     def coordinate_system(self) -> str:
+        if self.flags & TrackingFlags.CALIBRATED:
+            return "screen_pixels"
         if not self.flags & TrackingFlags.PUPIL_ONLY:
             return "pupil_minus_cr"
         return (

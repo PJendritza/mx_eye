@@ -76,8 +76,9 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
         service.close()
 
 
-def test_gui_menus_modes_and_suspended_views(monkeypatch):
+def test_gui_menus_modes_and_suspended_views(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("MX_EYE_CALIBRATION_DIR", str(tmp_path / "calibrations"))
     from PySide6 import QtWidgets as W
     from mx_eye.gui import Settings, Window
     from mx_eye.cameras import CameraModeDiscovery
@@ -107,6 +108,28 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch):
         assert [a.text() for a in window.menuBar().actions()] == [
             "File", "Settings", "Calibration", "Tools"
         ]
+        calibration_action = window.menuBar().actions()[2]
+        assert calibration_action.menu() is None
+        calibration_action.trigger()
+        app.processEvents()
+        assert window.calibration_window.isVisible()
+        assert window.calibration_window.profile.screen_width == 1024
+        assert window.calibration_window.profile.screen_height == 600
+        page = window.calibration_window.screen_page.rect()
+        assert (page.width(), page.height()) == (600, 1024)
+        window.calibration_window.update_sample(10, 20)
+        before_x, before_y = window.calibration_window.trace.getData()
+        window.calibration_window.offset_x.setValue(100)
+        app.processEvents()
+        after_x, after_y = window.calibration_window.trace.getData()
+        assert (before_x[-1], before_y[-1]) == pytest.approx((320, 502))
+        assert (after_x[-1], after_y[-1]) == pytest.approx((320, 402))
+        window.source.setCurrentIndex(
+            window.source.findData(cfg.SourceMode.SIMULATION.value)
+        )
+        assert window.full.toolTip() == ""
+        assert window.eye.toolTip() == ""
+        assert window.simulation_info.isVisible()
         assert window.reason_label.isVisible()
         assert window.playback_note.isVisible()
         geometry = (window.eye.geometry(), window.full.geometry(), window.size())

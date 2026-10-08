@@ -501,6 +501,7 @@ def tracking_worker(
     recording_marker_generation = 0
     report(events, "priority", message=priority("tracking"))
     core = Tracker(config.value.tracking)
+    active_calibration = config.value.calibration
     if config.value.template:
         restore_template(core, config.value.template)
     net = config.value.network
@@ -536,6 +537,8 @@ def tracking_worker(
                         core.config = cmd["tracking"].model_copy(deep=True)
                         if previous_mode != core.config.tracking_mode or previous_method != core.config.pupil_method:
                             core.clear_feature_history()
+                    elif kind == "calibration":
+                        active_calibration = cmd["profile"]
                     elif kind == "roi":
                         core.roi = list(cmd["roi"])
                         core.clamp_roi()
@@ -611,6 +614,11 @@ def tracking_worker(
                 if config.value.source.mode is SourceMode.SIMULATION:
                     flags |= TrackingFlags.SIMULATION
                 send = time.time_ns()
+                output_x, output_y = result["x"], result["y"]
+                if active_calibration is not None and result["valid"]:
+                    output_x, output_y = active_calibration.apply(output_x, output_y)
+                    if math.isfinite(output_x) and math.isfinite(output_y):
+                        flags |= TrackingFlags.CALIBRATED
                 payload = DataFrame(
                     session=session,
                     sequence=seq,
@@ -620,8 +628,8 @@ def tracking_worker(
                     tracking_end_ns=end,
                     send_ns=send,
                     media_ns=media,
-                    x=result["x"],
-                    y=result["y"],
+                    x=output_x,
+                    y=output_y,
                     pupil_x=pupil["x"] if pupil else nan,
                     pupil_y=pupil["y"] if pupil else nan,
                     cr_x=cr["x"] if cr else nan,

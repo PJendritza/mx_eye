@@ -549,6 +549,8 @@ class Service:
             return self.snapshot()
         if command == "record":
             return self._record(bool(args["enabled"]))
+        if command == "calibration":
+            self.config.value.calibration = args["profile"]
         if command == Command.START:
             return self._start()
         if command == Command.STOP:

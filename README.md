@@ -157,3 +157,33 @@ every frame; a sustained shortfall below 95% of the requested speed displays
 Follow-up (not addressed here): on the Raspberry Pi, a standalone recording
 application achieves 60 FPS while mx_eye recording appears slower. Compare the
 capture/recording paths and profile the cause separately after validating timing.
+
+### Interactive simulation
+
+Select **Simulation** and press **Start**. A synthetic marmoset face has two eyes,
+pupils, corneal reflections and distinct, stable markings for template tracking.
+The left eye starts inside the default ROI. Frames use the normal acquisition,
+tracking, preview, transmission and optional recording paths.
+
+**Manipulate simulation** is enabled by default and appears only in Simulation
+mode above the source view. It controls both source and eye-detail views.
+Uncheck it for normal pupil/CR selection, threshold estimation, and ROI/template
+controls. Holding Ctrl temporarily unchecks and disables the toggle; releasing
+Ctrl restores its previous state. Tracking continues in either mode.
+
+| Gesture in either view with manipulation enabled | Action |
+|---|---|
+| Left-click inside an eye | Saccade: move both pupils to the corresponding gaze position |
+| Left-drag inside an eye | Move pupils continuously, independently of the face and CRs |
+| Left-drag elsewhere | Move the whole face, including both eyes and CRs |
+| Right-click | Blink both eyes for 350 ms, then reopen automatically |
+| Shift-click | Capture a template at the pointer |
+| Hold Ctrl | Use normal pupil/CR selection, ROI and search-window dragging |
+| Ctrl + Shift-drag in source view | Draw a new ROI |
+
+Start by Shift-clicking near the left eye and enabling template tracking, then
+move the face to test whether the ROI follows it. Eye markings differ so that
+matching does not confuse the two eyes. Large saccades/head movements can exceed
+the configured tracking gates; this deliberately lets you test loss and
+reacquisition. Gaze is limited to the visible eye. The face stays still until
+moved; there are no automatic blinks or scripted movements. Restarting resets it.

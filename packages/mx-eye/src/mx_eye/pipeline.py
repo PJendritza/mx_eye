@@ -1,6 +1,7 @@
 """Acquisition, tracking and recording workers. Each runs in its own process."""
 
 import base64
+import contextlib
 import csv
 import json
 import math
@@ -30,6 +31,7 @@ from .config import TrackingConfig
 from .tracking import Tracker
 from .transport import Publisher
 from .video import PlaybackClock, VideoReader
+from .simulation import Simulation
 
 
 class Mailbox:
@@ -200,24 +202,13 @@ def report(events, kind, **data):
 
 
 def synthetic_frame(index, width, height, fps):
-    """Deterministic artificial eye for installation and transport checks."""
-    t = index / fps
-    frame = np.full((height, width, 3), 155, np.uint8)
-    cx, cy = (
-        int(width * 0.25 + 22 * math.sin(t * 1.6)),
-        int(height * 0.25 + 12 * math.cos(t * 1.1)),
-    )
-    cv2.ellipse(frame, (cx, cy), (44, 25), 0, 0, 360, (95, 95, 95), -1)
-    if t % 7 < 6.8:
-        pupil_center = (cx + int(3 * math.sin(t * 5)), cy + int(2 * math.sin(t * 2.9)))
-        cv2.ellipse(frame, pupil_center, (11, 9), 10, 0, 360, (15, 15, 15), -1)
-        cv2.circle(frame, (cx + 5, cy - 4), 2, (245, 245, 245), -1)
-    return frame
+    """Static neutral face for noninteractive installation checks."""
+    return Simulation(width, height).render((0, 0, 0, 0, 0), index / fps)
 
 
 def capture_worker(
     config, mailbox, ring, stop, done, paused, commands, tracked_frame, stats, events,
-    recording=None, recording_stop=None, recording_capture_done=None, recording_generation=None,
+    recording=None, recording_stop=None, recording_capture_done=None, recording_generation=None, simulation_state=None,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
@@ -267,6 +258,7 @@ def capture_worker(
             total = 0
         else:
             fps, total = source.fps, 0
+            simulation = Simulation(source.width, source.height)
         stats["source_fps"].value = fps
         report(events, "source", fps=fps, total=total, mode=mode)
         if mode is SourceMode.CAMERA:
@@ -341,7 +333,9 @@ def capture_worker(
                 if delay > 0 and stop.wait(delay):
                     break
             if mode is SourceMode.SIMULATION:
-                frame = synthetic_frame(index, source.width, source.height, fps)
+                with simulation_state.get_lock() if simulation_state is not None else contextlib.nullcontext():
+                    state = tuple(simulation_state) if simulation_state is not None else (0, 0, 0, 0, 0)
+                frame = simulation.render(state, time.monotonic())
                 ok = True
             elif mode is SourceMode.VIDEO:
                 requested_index = index

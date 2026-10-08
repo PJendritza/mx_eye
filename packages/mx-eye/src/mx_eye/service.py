@@ -216,6 +216,7 @@ class Service:
             paused=c.Event(),
             commands=c.Queue(64),
             capture_commands=c.Queue(16),
+            simulation=c.Array("d", [0, 0, 0, 0, 0]) if s.mode is SourceMode.SIMULATION else None,
             preview=PreviewMailbox(c, max_bytes),
             events=c.Queue(64),
             tracked_frame=c.Value("q", 0),
@@ -302,6 +303,7 @@ class Service:
                     run["recording_stop"],
                     run["recording_capture_done"],
                     run["recording_generation"],
+                    run["simulation"],
                 ),
             )
             capture.start()
@@ -534,6 +536,17 @@ class Service:
             self.run = None
 
     def _execute(self, command, args):
+        if command == "simulation":
+            if self.run and self.config.value.source.mode is SourceMode.SIMULATION:
+                state = self.run["simulation"]
+                with state.get_lock():
+                    if args["gesture"] == "head":
+                        state[0], state[1] = args["position"]
+                    elif args["gesture"] == "gaze":
+                        state[2], state[3] = args["position"]
+                    elif args["gesture"] == "blink":
+                        state[4] = time.monotonic() + .35
+            return self.snapshot()
         if command == "record":
             return self._record(bool(args["enabled"]))
         if command == Command.START:

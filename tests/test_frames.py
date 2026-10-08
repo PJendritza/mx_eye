@@ -84,7 +84,8 @@ def test_auto_enum_wire_values():
         int(TrackingFlags.PUPIL_ONLY),
         int(TrackingFlags.SIMULATION),
         int(TrackingFlags.ROI_RELATIVE),
-    ) == (0, 1, 2, 4, 8, 16, 32)
+        int(TrackingFlags.CALIBRATED),
+    ) == (0, 1, 2, 4, 8, 16, 32, 64)
 
 
 @pytest.mark.parametrize(
@@ -119,6 +120,7 @@ def test_float32_and_missing_values(payload):
         (TrackingFlags.ROI_RELATIVE, "pupil_minus_cr"),
         (TrackingFlags.PUPIL_ONLY, "image_absolute"),
         (TrackingFlags.PUPIL_ONLY | TrackingFlags.ROI_RELATIVE, "roi_relative"),
+        (TrackingFlags.CALIBRATED, "screen_pixels"),
     ],
 )
 def test_coordinates(payload, flags, coordinates):

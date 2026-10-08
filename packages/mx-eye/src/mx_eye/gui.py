@@ -13,17 +13,20 @@ from PySide6 import QtGui as G
 from PySide6 import QtWidgets as W
 
 from . import config as cfg
+from .calibration import CalibrationStore
+from .calibration_gui import CalibrationWindow
 from .cameras import CameraControls, CameraModeDiscovery
 from .config import (
     PUPIL_METHODS,
-    PupilMethod,
     PupilCoordinates,
+    PupilMethod,
     SourceMode,
     TrackingMode,
 )
 from .helptext import TIPS, add_tooltips
+from .paths import data_root
 from .service import Service
-from .simulation import Simulation, SIMULATION_HINT
+from .simulation import SIMULATION_HINT, Simulation
 from .widgets import EyeView, Parameter, Section, SeekSlider, label
 
 ENUM_FIELDS = {
@@ -169,6 +172,13 @@ class Window(W.QMainWindow):
     def __init__(self):
         super().__init__()
         config = cfg.store()
+        self.calibration_store = CalibrationStore()
+        try:
+            saved_calibration = self.calibration_store.load_last_active()
+        except (OSError, TypeError, ValueError):
+            saved_calibration = None
+        if saved_calibration is not None:
+            config.value.calibration = saved_calibration
         self.setWindowTitle("mx_eye · MXBI eye tracker")
         self.resize(1350, 870)
         self.setMinimumSize(980, 650)
@@ -186,6 +196,7 @@ class Window(W.QMainWindow):
         self.rate_last = (time.monotonic(), 0, 0)
         self.rates = (0, 0)
         self._closing = False
+        self.calibration_window = None
         self.saved_source_path = config.value.source.path
         self.pending_video_path = None
         self._reason_text = self._error_text = ""
@@ -254,17 +265,17 @@ class Window(W.QMainWindow):
         self.file_menu = self.menuBar().addMenu("File")
         for title, callback in [
             ("Open video…", self.open_video),
-            ("Save configuration…", self.save_config),
+            ("Save current settings", self.save_current_settings),
+            ("Export configuration…", self.save_config),
             ("Load configuration…", self.load_config),
+            ("Data directory…", self.show_data_directory),
             ("Save template…", self.save_template),
             ("Load template…", self.load_template),
             ("Exit", self.close),
         ]:
             self.file_menu.addAction(title, callback)
         self.menuBar().addAction("Settings", self.settings)
-        calibration = self.menuBar().addMenu("Calibration")
-        placeholder = calibration.addAction("Calibration tools · planned")
-        placeholder.setEnabled(False)
+        self.menuBar().addAction("Calibration", self.show_calibration)
         tools = self.menuBar().addMenu("Tools")
         tools.addAction("Timing / performance diagnostics…", self.show_diagnostics)
         self.diagnostics = None
@@ -380,7 +391,17 @@ class Window(W.QMainWindow):
             notice.setFixedHeight(notice.fontMetrics().height() + 8)
             notice.setMinimumWidth(0)
             notice.setSizePolicy(W.QSizePolicy.Ignored, W.QSizePolicy.Fixed)
-            column.addWidget(notice)
+            footer = W.QHBoxLayout()
+            footer.setContentsMargins(0, 0, 0, 0)
+            footer.addWidget(notice, 1)
+            if view is self.full:
+                self.simulation_info = W.QToolButton()
+                self.simulation_info.setText("ⓘ")
+                self.simulation_info.setToolTip("Simulation controls")
+                self.simulation_info.setAutoRaise(True)
+                self.simulation_info.clicked.connect(self.show_simulation_help)
+                footer.addWidget(self.simulation_info)
+            column.addLayout(footer)
             views.addWidget(panel)
             view.action.connect(self.view_action)
         self.update_simulation_controls()
@@ -656,6 +677,29 @@ class Window(W.QMainWindow):
         if hasattr(self, "param_timer"):
             self.param_timer.start(80)
 
+    def show_calibration(self):
+        if self.calibration_window is None:
+            self.calibration_window = CalibrationWindow(
+                self.calibration_store,
+                self.service.config.value.calibration,
+                self,
+            )
+            self.calibration_window.profileChanged.connect(
+                self.apply_calibration_profile
+            )
+            self.apply_calibration_profile(self.calibration_window.profile)
+            self.calibration_window.destroyed.connect(
+                lambda: setattr(self, "calibration_window", None)
+            )
+        self.calibration_window.show()
+        self.calibration_window.raise_()
+        self.calibration_window.activateWindow()
+
+    def apply_calibration_profile(self, profile):
+        self.service.config.value.calibration = profile
+        if self.service.run:
+            self.call("calibration", profile=profile)
+
     def send_parameters(self):
         tracking = self.service.config.value.tracking.model_copy(deep=True)
         for key, param in self.parameters.items():
@@ -711,15 +755,21 @@ class Window(W.QMainWindow):
     def update_simulation_controls(self, *args):
         simulation = self.source_mode() is SourceMode.SIMULATION
         self.manipulate_simulation.setVisible(simulation)
+        self.simulation_info.setVisible(simulation)
         for view in (self.full, self.eye):
             view.simulation_drag = None
             view.drag = None
             view.drag_preview = None
             view.update()
-        self.full.setToolTip(SIMULATION_HINT if simulation and self.manipulate_simulation.isChecked()
-                             else "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom")
-        self.eye.setToolTip(SIMULATION_HINT if simulation and self.manipulate_simulation.isChecked()
-                            else "Left-click pupil · Right-click CR · Shift-click template")
+        self.full.setToolTip(
+            "" if simulation else "Drag ROI · Shift-drag new ROI · Right-click template · Wheel zoom"
+        )
+        self.eye.setToolTip(
+            "" if simulation else "Left-click pupil · Right-click CR · Shift-click template"
+        )
+
+    def show_simulation_help(self):
+        W.QMessageBox.information(self, "Simulation controls", SIMULATION_HINT)
 
     def simulation_context(self):
         if not self.manipulate_simulation.isChecked() or self.source_mode() is not SourceMode.SIMULATION:
@@ -886,29 +936,51 @@ class Window(W.QMainWindow):
             self, "Save configuration", "mx_eye_config.json", "JSON (*.json)"
         )
         if path:
-            config = cfg.MxEyeConfigStore(
-                self.service.config.value.model_copy(deep=True)
-            )
-            config.value.display.pupil_mask = self.pupil_mask.isChecked()
-            config.value.display.cr_mask = self.cr_mask.isChecked()
-            config.value.display.crosshairs = self.crosshairs.isChecked()
-            config.value.display.template_circle = self.circle.isChecked()
-            config.value.display.template_inset = self.inset.isChecked()
-            config.value.display.suspended = self.display_pause.isChecked()
-            config.value.source.mode = self.source_mode()
-            config.value.source.path = self.saved_source_path
-            config.value.source.camera = self.camera.value()
-            config.value.source.speed = self.speed.value()
-            for key, param in self.parameters.items():
-                setattr(config.value.tracking, key, param.spin.value())
-            config.value.tracking.tracking_mode = self.tracking_mode()
-            config.value.tracking.pupil_method = PupilMethod(self.pupil_method.currentData())
-            config.value.tracking.pupil_coordinates = self.pupil_coordinates()
-            config.value.tracking.template_tracking = self.template_on.isChecked()
             try:
-                config.save(Path(path))
+                self._config_snapshot().save(Path(path))
             except (ValueError, OSError) as exc:
                 W.QMessageBox.warning(self, "Cannot save", str(exc))
+
+    def _config_snapshot(self):
+        config = cfg.MxEyeConfigStore(
+            self.service.config.value.model_copy(deep=True),
+            self.service.config.path,
+        )
+        config.value.display.pupil_mask = self.pupil_mask.isChecked()
+        config.value.display.cr_mask = self.cr_mask.isChecked()
+        config.value.display.crosshairs = self.crosshairs.isChecked()
+        config.value.display.template_circle = self.circle.isChecked()
+        config.value.display.template_inset = self.inset.isChecked()
+        config.value.display.suspended = self.display_pause.isChecked()
+        config.value.source.mode = self.source_mode()
+        config.value.source.path = self.saved_source_path
+        config.value.source.camera = self.camera.value()
+        config.value.source.speed = self.speed.value()
+        for key, param in self.parameters.items():
+            setattr(config.value.tracking, key, param.spin.value())
+        config.value.tracking.tracking_mode = self.tracking_mode()
+        config.value.tracking.pupil_method = PupilMethod(
+            self.pupil_method.currentData()
+        )
+        config.value.tracking.pupil_coordinates = self.pupil_coordinates()
+        config.value.tracking.template_tracking = self.template_on.isChecked()
+        return config
+
+    def save_current_settings(self):
+        try:
+            config = self._config_snapshot()
+            config.save_persistent()
+            self.service.config.replace(config.value)
+        except (ValueError, OSError) as exc:
+            W.QMessageBox.warning(self, "Cannot save settings", str(exc))
+
+    def show_data_directory(self):
+        W.QMessageBox.information(
+            self,
+            "mx_eye data directory",
+            f"Settings and animal calibrations are stored in:\n\n{data_root()}\n\n"
+            "Start mx_eye with --data-dir PATH to use another directory.",
+        )
 
     def save_template(self):
         template = self.service.config.value.template
@@ -1204,6 +1276,8 @@ class Window(W.QMainWindow):
         else:
             payload = self.last_payload
         r = payload["result"]
+        if fresh_payload and self.calibration_window is not None:
+            self.calibration_window.update_sample(r["x"], r["y"])
         full_params = payload["tracking"].model_copy(
             update={"template_radius": self.parameters["template_radius"].spin.value()}
         )
@@ -1329,6 +1403,12 @@ class Window(W.QMainWindow):
             C.QTimer.singleShot(100, self.close)
             return
         self.camera_discovery.stop()
+        try:
+            self._config_snapshot().save_persistent()
+        except (ValueError, OSError):
+            pass
+        if self.calibration_window is not None:
+            self.calibration_window.close()
         self.timer.stop()
         self.service.close()
         event.accept()

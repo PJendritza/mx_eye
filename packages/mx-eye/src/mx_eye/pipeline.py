@@ -242,7 +242,6 @@ def capture_worker(
             mode_warnings = []
             if failed_requests:
                 mode_warnings.append('Camera did not acknowledge: ' + ', '.join(failed_requests))
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 raise RuntimeError("Cannot open camera. Check camera index/backend.")
             try:

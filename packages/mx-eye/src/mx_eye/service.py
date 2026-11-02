@@ -2,7 +2,6 @@
 
 import base64
 import concurrent.futures
-import datetime
 import json
 import multiprocessing as mp
 import queue
@@ -25,6 +24,9 @@ from mx_eye_protocol.control import (
 
 from .config import MxEyeConfigStore, SourceMode
 from .control_server import ControlServer
+from .experiment_events import EventJournal
+from .recording import reserve_recording_directory
+from mx_eye_protocol.events import ExperimentEventKind
 from .video import VideoReader
 from .pipeline import (
     FrameRing,
@@ -50,6 +52,8 @@ STAT_NAMES = (
     "source_fps",
     "source_index",
     "processing_us",
+    "recorded_seconds",
+    "recording_dropped",
 )
 
 
@@ -79,6 +83,9 @@ class Service:
         self.priority_info = []
         self._server_errors = []
         self._server = None
+        self.experiment_events = EventJournal()
+        self._event_visit = None
+        self._event_directory = None
         self._owner = threading.Thread(
             target=self._supervise, daemon=True, name="mx-eye supervisor"
         )
@@ -131,6 +138,11 @@ class Service:
                 source=SourceStatus.model_validate(self.source_info),
                 priority=list(self.priority_info),
                 server_errors=list(self._server_errors),
+                recording=bool(run and run["recording"].is_set()),
+                recording_finalizing=bool(run and not run["recording"].is_set()
+                                          and not run["writer_done"].is_set()),
+                experiment_event=self.experiment_events.latest,
+                event_log=self.experiment_events.path,
             )
 
     def preview(self):
@@ -178,7 +190,35 @@ class Service:
     def _dispatch_request(self, request: ControlRequest) -> ControlReply:
         if request.command is Command.STATUS:
             return ControlReply(status=self.snapshot())
-        return ControlReply(status=self.submit(request.command).result(timeout=15))
+        args = {"event": request.experiment_event} if request.experiment_event else {}
+        return ControlReply(status=self.submit(request.command, **args).result(timeout=15))
+
+    def _experiment_event(self, event):
+        if self.experiment_events.contains(event):
+            return self.snapshot()
+        owner = (event.run_id, event.visit_id)
+        kind = event.kind
+        if kind is ExperimentEventKind.ANIMAL_ENTERED and event.control_recording:
+            if not event.visit_id:
+                raise ValueError("Recording requires a visit_id")
+            if self._event_visit is not None and self._event_visit != owner:
+                raise RuntimeError("End the current animal visit before starting another")
+            if self._event_visit is None:
+                if self.run and self.run["recording"].is_set():
+                    raise RuntimeError("Stop the manual recording before enabling animal recording")
+                self._record(True)
+                self._event_visit, self._event_directory = owner, self.directory
+                (Path(self.directory) / "experiment.json").write_text(
+                    event.model_dump_json(indent=2), encoding="utf-8"
+                )
+        directory = self._event_directory if owner == self._event_visit else None
+        self.experiment_events.save(event, directory)
+        if kind in (ExperimentEventKind.ANIMAL_LEFT, ExperimentEventKind.RUN_ENDED,
+                    ExperimentEventKind.DETECTOR_FAULT) and owner == self._event_visit:
+            if self.run and self.state == "running":
+                self._record(False)
+            self._event_visit = self._event_directory = None
+        return self.snapshot()
 
     def _start(self):
         if self.run:
@@ -351,17 +391,14 @@ class Service:
             previous.join()
         if run["stats"]["record_fault"].value:
             raise RuntimeError("Restart tracking after resolving the recording fault.")
-        for key in ("enqueued", "written", "record_acquired", "log_fault"):
+        config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
+        directory = reserve_recording_directory(Path(config.value.recording.directory))
+        for key in ("enqueued", "written", "record_acquired", "log_fault", "recorded_seconds", "recording_dropped"):
             run["stats"][key].value = 0
         run["recording_stop"].clear()
         run["writer_done"].clear()
         run["ready"].discard("writer_ready")
-        config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.directory = str(
-            Path(config.value.recording.directory).expanduser().resolve()
-            / f"{stamp}_{self.session:016x}"
-        )
+        self.directory = str(directory)
         writer = self.ctx.Process(
             target=writer_worker,
             name="mx-eye recording",
@@ -378,6 +415,7 @@ class Service:
                 run["events"],
             ),
             kwargs={
+                "directory_reserved": True,
                 "recording_capture_done": run["recording_capture_done"],
                 "recording_generation": run["recording_generation"].value + 1,
             },
@@ -523,6 +561,8 @@ class Service:
                     data = json.loads(path.read_text()) if path.exists() else {}
                     data.update(
                         complete=False,
+                        all_frames_saved=False,
+                        recording_result="failed",
                         supervisor_message=self.message,
                         stats=self.last_stats,
                     )
@@ -536,6 +576,12 @@ class Service:
             self.run = None
 
     def _execute(self, command, args):
+        if command == Command.EXPERIMENT_EVENT:
+            return self._experiment_event(args["event"])
+        if command == Command.RECORDING_START:
+            return self._record(True)
+        if command == Command.RECORDING_STOP:
+            return self._record(False)
         if command == "simulation":
             if self.run and self.config.value.source.mode is SourceMode.SIMULATION:
                 state = self.run["simulation"]

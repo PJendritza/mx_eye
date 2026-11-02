@@ -19,6 +19,7 @@ from typing import Self
 
 from mx_eye_protocol.calibration import CalibrationConfig, CalibrationState
 from mx_eye_protocol.control import Command, ControlRequest, StatusSnapshot
+from mx_eye_protocol.events import ExperimentEvent
 
 from .calibration import CalibrationClient, CalibrationSession, calibration_result
 from .control import ControlClient
@@ -115,6 +116,22 @@ class MxEye:
 
     def status(self) -> StatusSnapshot:
         return self._control.request_status(Command.STATUS)
+
+    def send_event(self, event: ExperimentEvent) -> StatusSnapshot:
+        """Acknowledge a saved experiment event. Retry with the same event_id."""
+        reply = self._control.rpc(ControlRequest(
+            command=Command.EXPERIMENT_EVENT, experiment_event=event
+        ), timeout=max(20.0, self.config.timeout))
+        if reply.status is None:
+            raise ValueError("Expected event acknowledgement status")
+        return reply.status
+
+    def start_recording(self) -> StatusSnapshot:
+        return self._control.request_status(Command.RECORDING_START, timeout=20.0)
+
+    def stop_recording(self) -> StatusSnapshot:
+        """Stop accepting frames; poll status until recording_finalizing is false."""
+        return self._control.request_status(Command.RECORDING_STOP)
 
     def start_calibration(self, config: CalibrationConfig) -> CalibrationSession:
         """Start stimulus submission, independently of acquisition and read().

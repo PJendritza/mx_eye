@@ -1,6 +1,23 @@
 """CSV representation of tracking payloads, independent of the wire codec."""
 
 from mx_eye_protocol.data_frame import DataFrame
+from datetime import datetime
+from pathlib import Path
+
+
+def reserve_recording_directory(root: Path, now: datetime | None = None) -> Path:
+    """Reserve a timestamp folder atomically, without overwriting a recording."""
+    root = root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
+    suffix = 0
+    while True:
+        folder = root / (stamp if suffix == 0 else f"{stamp}_{suffix:02d}")
+        try:
+            folder.mkdir()
+            return folder
+        except FileExistsError:
+            suffix += 1
 
 # Output column name -> payload attribute; insertion order is the CSV order.
 TRACKING_COLUMNS = {

@@ -144,6 +144,36 @@ including tracking parameters and ROI, is saved when the application closes.
 
 ### Timestamped recording and playback
 
+New recording folders use local date and time, for example
+`recordings/2026-11-02_14-30-15/video.mkv`. If that second already exists,
+the next folder receives `_01`, `_02`, etc.; existing recordings are never
+overwritten or renamed. The GUI reports recording/finalizing/saved/failed state,
+frames written, their acquisition-time span in seconds, and queued frames. This
+duration describes video received by the writer, rather than the time since
+pressing Record; it freezes when no more video is written. The recording root
+is configurable in Settings → Recording. Relative paths resolve from the launch
+directory; runtime settings in `mx_eye_data` are separate from video recordings.
+
+Recording is best effort: if the bounded buffer fills, incoming video frames are
+skipped and counted while recording and tracking continue. The GUI shows the
+recording skip count separately from tracking skips. Saved frames keep their
+original acquisition timestamps, so skipped frames create time gaps rather than
+sped-up playback. `session.json` reports `recording_dropped` and
+`recording_result` (`completed`, `completed_with_skips`, or `failed`). `complete`
+means the recording finalized with all acquired frames accounted for as saved or
+skipped; `all_frames_saved` additionally requires zero skips. Disk, encoder, and
+capture failures still report an incomplete recording.
+
+On the `feature/mxbi-events` branch, the SDK also accepts acknowledged MXBI Flow
+animal/RFID and stimulus events. The tracker shows the latest event below its
+controls. Animal entry/exit can start/stop a recording while acquisition stays
+running. Recordings include `experiment.json` (entry context) and `events.jsonl`;
+an independent event journal lives under `mx_eye_data/events`. Shared run and
+visit IDs link these to the framework's `eye_events` log. Use the matching local
+`feature/mx-eye-events` framework branch; its `docs/mx-eye-events.md` contains the
+PC demo commands and limitations. This does not change calibration selection or
+the existing malformed-JPEG error behavior.
+
 Recordings use `video.mkv` with per-frame presentation timestamps derived from
 monotonic host acquisition time. Accessible camera MJPEG packets are copied without
 re-encoding; decoded BGR frames use lossless FFV1. The Windows OpenCV camera path

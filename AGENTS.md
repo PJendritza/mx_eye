@@ -147,11 +147,11 @@ Parameter adjustments during acquisition affect tracking.csv; config.json record
 settings at recording start only. Save the final configuration separately if needed.
 
 The configurable memory budget is a finite buffer, not an unlimited guarantee.
-If the writer cannot keep up and that buffer fills, recording stops accepting new
-frames, the queued prefix is finalized, and the session is marked incomplete.
-**Tracking continues.** A disk/write fault is similarly visible. Restart a new
-session after resolving the fault. It is impossible to guarantee both unlimited
-lossless recording and nonblocking tracking on a stalled disk with finite RAM.
+If the writer cannot keep up and that buffer fills, incoming video frames are
+skipped and counted in `recording_dropped`; recording and tracking continue.
+Saved frames retain their acquisition timestamps, including gaps. The GUI shows
+recording skips separately from tracking skips. A disk/write fault still stops
+recording and marks the session incomplete; restart tracking after resolving it.
 
 Stop initiates orderly shutdown and buffer draining. Wait for IDLE or ERROR before
 starting another session or removing the disk. Closing the tracker waits for this.
@@ -159,8 +159,11 @@ A hung camera is forcibly stopped after 5 seconds; hung tracking/writing after
 30 seconds. Forced termination marks the session incomplete. After abrupt power
 loss, a missing session.json must also be treated as an incomplete session.
 
-Completion checks compare recording-acquired/enqueued/written counts and reopen
-the video to check readability. VFR header frame-count estimates are not used to
+Completion checks require acquired = written + skipped and enqueued = written,
+and reopen the video to check readability. `complete` means orderly finalization
+with all frames accounted for; `all_frames_saved` additionally requires no skips.
+`recording_result` distinguishes `completed`, `completed_with_skips`, and `failed`.
+VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside
 the camera or USB driver. `tracking_log_complete` separately reports log overflow.

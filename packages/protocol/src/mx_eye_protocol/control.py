@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .calibration import CalibrationConfig, CalibrationStatus, CalibrationStop
+from .events import ExperimentEvent
 
 
 class Command(StrEnum):
@@ -15,6 +16,9 @@ class Command(StrEnum):
     STOP = auto()
     CALIBRATION_START = auto()
     CALIBRATION_STOP = auto()
+    EXPERIMENT_EVENT = auto()
+    RECORDING_START = auto()
+    RECORDING_STOP = auto()
 
 
 class SourceMode(StrEnum):
@@ -46,6 +50,8 @@ class TrackingStats(ControlModel):
     source_fps: float = 0.0
     source_index: int = 0  # Zero-based media frame index.
     processing_us: float = 0.0  # Most recent tracking duration, microseconds.
+    recorded_seconds: float = 0.0  # Acquisition-time span of frames handed to the writer.
+    recording_dropped: int = 0  # Frames skipped because the recording FIFO was full.
 
 
 class NetworkStatus(ControlModel):
@@ -79,6 +85,10 @@ class StatusSnapshot(ControlModel):
     priority: list[str] = Field(default_factory=list)
     server_errors: list[str] = Field(default_factory=list)
     calibration: CalibrationStatus | None = None
+    recording: bool = False
+    recording_finalizing: bool = False
+    experiment_event: ExperimentEvent | None = None
+    event_log: str = ""
 
 
 class ControlRequest(ControlModel):
@@ -88,9 +98,14 @@ class ControlRequest(ControlModel):
     protocol: Literal["1.1.0"] = "1.1.0"
     calibration_start: CalibrationConfig | None = None
     calibration_stop: CalibrationStop | None = None
+    experiment_event: ExperimentEvent | None = None
 
     @model_validator(mode="after")
     def validate_calibration_command(self) -> "ControlRequest":
+        if (self.experiment_event is not None) != (
+            self.command is Command.EXPERIMENT_EVENT
+        ):
+            raise ValueError("experiment_event is required only for experiment_event commands")
         if (self.calibration_start is not None) != (
             self.command is Command.CALIBRATION_START
         ):

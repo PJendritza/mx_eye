@@ -75,7 +75,7 @@ class Settings(W.QDialog):
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
             "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. Samples use ZeroMQ PUB/SUB; commands use REQ/REP. Control is unauthenticated: use only your trusted local network.",
-            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, recording stops and is marked incomplete; tracking continues.",
+            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, incoming frames are skipped and counted; recording and tracking continue. Acquisition timestamps preserve the gaps.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }
         for title, (group, rows) in specs.items():
@@ -195,6 +195,8 @@ class Window(W.QMainWindow):
         self.last_session = None
         self.rate_last = (time.monotonic(), 0, 0)
         self.rates = (0, 0)
+        self.recording_rate_last = None
+        self.recording_rate = 0
         self._closing = False
         self.calibration_window = None
         self.saved_source_path = config.value.source.path
@@ -290,16 +292,19 @@ class Window(W.QMainWindow):
         metrics_row = W.QHBoxLayout(metrics_bar)
         metrics_row.setContentsMargins(13, 8, 13, 8)
         metrics_row.setSpacing(12)
-        self.metrics = label("ACQ —  TRACK —  PROC —  SKIPPED —  VIDEO —", "muted")
+        self.metrics = label("CAM —  TRACK —  REC —  Tracking skipped —", "muted")
         self.metrics.setFont(G.QFontDatabase.systemFont(G.QFontDatabase.FixedFont))
         self.metrics.setFixedWidth(self.metrics.fontMetrics().horizontalAdvance(
-            "ACQ 999.9 fps  TRACK 999.9 fps  PROC 999.99 ms  SKIPPED 999999  VIDEO 999999 frames · buffer 9999"
+            "SOURCE 999.9 fps  TRACK 999.9 fps  REC 999.9 fps  Tracking skipped 999999"
         ))
         self.metrics.setToolTip("Acquisition, tracking and recording status")
         metrics_row.addWidget(self.metrics)
         self.reason_label = label("", "metricAlert")
         metrics_row.addStretch()
         layout.addWidget(metrics_bar)
+        self.recording_status = label("Not recording", "muted")
+        self.recording_status.setWordWrap(True)
+        layout.addWidget(self.recording_status)
         split = W.QSplitter(C.Qt.Horizontal)
         layout.addWidget(split, 1)
         main = W.QWidget()
@@ -595,6 +600,9 @@ class Window(W.QMainWindow):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(C.Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
+        self.experiment_status = label("MXBI: no experiment events received", "muted")
+        self.experiment_status.setWordWrap(True)
+        layout.addWidget(self.experiment_status)
         self.param_timer = C.QTimer(self)
         self.param_timer.setSingleShot(True)
         self.param_timer.timeout.connect(self.send_parameters)
@@ -1135,6 +1143,15 @@ class Window(W.QMainWindow):
                     )
         state = self.service.snapshot()
         mode = self.source_mode()
+        experiment = state.experiment_event
+        if experiment is not None:
+            absent = experiment.kind in ("animal_left", "run_ended", "detector_fault")
+            animal = "No animal" if absent else experiment.animal or "Unknown animal"
+            self.experiment_status.setText(
+                f"MXBI: {animal} · RFID {experiment.rfid_id or 'unknown'} · "
+                f"{experiment.kind} · {experiment.stimulus_id or ''}"
+            )
+            self.experiment_status.setToolTip(state.event_log)
         if self.pending_video_path and not self.service.run and not self.pending:
             if (
                 mode is SourceMode.VIDEO
@@ -1168,7 +1185,7 @@ class Window(W.QMainWindow):
             self.requested_fps.setText(f"{source.fps:g} fps requested" if ready else "")
             self.requested_fps.setToolTip(
                 "Request validated against cached advertised modes when available. "
-                "ACQ shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
+                "CAM shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
         else:
             self.requested_fps.setText(f"{source.fps:g} fps")
             self.requested_fps.setToolTip("")
@@ -1193,6 +1210,27 @@ class Window(W.QMainWindow):
         self.record_button.setText("■ Stop recording" if recording else "Finalizing…" if draining else "● Record")
         self.record_button.setEnabled(state.state == "running" and mode is not SourceMode.VIDEO
                                       and not draining and not self.pending and not state.stats.record_fault)
+        if state.stats.record_fault:
+            recording_label = "FAILED — INCOMPLETE"
+        elif recording:
+            recording_label = "● RECORDING"
+        elif draining:
+            recording_label = "FINALIZING"
+        elif state.directory:
+            recording_label = "STOPPED" if state.stats.log_fault or state.stats.capture_fault else "SAVED"
+            if recording_label == "SAVED" and state.stats.recording_dropped:
+                recording_label = "SAVED WITH SKIPS"
+        else:
+            recording_label = "NOT RECORDING"
+        backlog_count = max(0, int(state.stats.enqueued - state.stats.written))
+        self.recording_status.setText(
+            f"{recording_label} · {int(state.stats.written):,} frames written · "
+            f"{state.stats.recorded_seconds:.1f} s video · "
+            f"{state.stats.recording_dropped:,} recording frames skipped · {backlog_count} frames queued"
+            + (f" · {Path(state.directory).name}/video.mkv" if state.directory else "")
+        )
+        self.recording_status.setToolTip(state.directory or str(
+            Path(self.service.config.value.recording.directory).expanduser().resolve()))
         video = active and self.service.config.value.source.mode is SourceMode.VIDEO
         if not video:
             self.navigation_pending = None
@@ -1228,6 +1266,8 @@ class Window(W.QMainWindow):
             self.last_history_frame = None
             self.last_session = state.session
             self.rate_last = (time.monotonic(), 0, 0)
+            self.rates = (0, 0)
+            self.recording_rate_last = None
         now = time.monotonic()
         last, a, t = self.rate_last
         if now - last >= 0.5:
@@ -1236,18 +1276,19 @@ class Window(W.QMainWindow):
                 (stats.tracked - t) / (now - last),
             )
             self.rate_last = (now, stats.acquired, stats.tracked)
-        backlog = int(stats.enqueued - stats.written)
-        recording = (
-            "FAULT — INCOMPLETE"
-            if stats.record_fault
-            else (
-                f"{int(stats.written)} frames · buffer {backlog}"
-                if state.directory
-                else "off"
-            )
-        )
-        if stats.log_fault:
-            recording += " · LOG INCOMPLETE"
+        if recording or draining:
+            previous = self.recording_rate_last
+            if previous is None or previous[2] != state.directory or stats.written < previous[1]:
+                self.recording_rate_last = (now, stats.written, state.directory)
+                self.recording_rate = 0
+            elif now - previous[0] >= 0.5:
+                self.recording_rate = (stats.written - previous[1]) / (now - previous[0])
+                self.recording_rate_last = (now, stats.written, state.directory)
+            recording_rate_text = f"{self.recording_rate:5.1f} fps"
+        else:
+            self.recording_rate_last = None
+            self.recording_rate = 0
+            recording_rate_text = "off"
         fault = bool(stats.capture_fault or stats.tracking_fault or stats.record_fault or stats.log_fault)
         if fault:
             self._error_text = state.message or "Acquisition, tracking, or recording error"
@@ -1255,11 +1296,15 @@ class Window(W.QMainWindow):
         elif self._error_until == float("inf"):
             self._error_until = now + 0.25
         metrics_text = (
-            f"ACQ {self.rates[0]:5.1f} fps  TRACK {self.rates[1]:5.1f} fps  "
-            f"PROC {stats.processing_us / 1000:6.2f} ms  "
-            f"SKIPPED {int(stats.tracking_skips):6d}  VIDEO {recording}"
+            f"{'CAM' if mode is SourceMode.CAMERA else 'SOURCE'} {self.rates[0]:5.1f} fps  "
+            f"TRACK {self.rates[1]:5.1f} fps  REC {recording_rate_text}  "
+            f"Tracking skipped {int(stats.tracking_skips):6d}"
         )
-        self.metrics.setToolTip(metrics_text)
+        self.metrics.setToolTip(
+            metrics_text + "\nCAM/SOURCE: frames received; TRACK: frames processed; "
+            "REC: frames written per elapsed second (also while finalizing). "
+            "Rates update every half second. Recording skips and totals are shown below."
+        )
         self.metrics.setText(self.metrics.fontMetrics().elidedText(
             metrics_text, C.Qt.ElideRight, self.metrics.width() - 2
         ))

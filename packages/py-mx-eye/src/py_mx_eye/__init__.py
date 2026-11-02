@@ -20,9 +20,12 @@ from mx_eye_protocol.calibration import (
 from .calibration import CalibrationSession
 from .eye import MxEye, MxEyeConfig
 from .sample import Sample
+from mx_eye_protocol.events import ExperimentEvent, ExperimentEventKind
 
 __version__ = "0.1.0"
 __all__ = [
+    "ExperimentEvent",
+    "ExperimentEventKind",
     "AnimalInfo",
     "CalibrationAck",
     "CalibrationConfig",

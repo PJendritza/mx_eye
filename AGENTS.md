@@ -138,6 +138,7 @@ Each recording gets a unique subfolder under the configured output directory:
 | `tracking.csv` | Every locally logged tracking sample, with timestamps, coordinates and flags |
 | `config.json` | Configuration at session start |
 | `session.json` | Final counts, completion status and any detected fault |
+| `camera_rejections.jsonl` | Timestamped malformed raw JPEG buffers rejected during this recording |
 
 `video.mkv` embeds acquisition-relative monotonic timestamps. `frames.csv` also
 stores full-resolution monotonic and synchronized wall-clock acquisition times.
@@ -163,6 +164,13 @@ Completion checks require acquired = written + skipped and enqueued = written,
 and reopen the video to check readability. `complete` means orderly finalization
 with all frames accounted for; `all_frames_saved` additionally requires no skips.
 `recording_result` distinguishes `completed`, `completed_with_skips`, and `failed`.
+Camera marker rejections are counted separately in `camera_rejected` in the
+recording summary and also make `all_frames_saved` false. Capture logs each
+rejection directly to `mx_eye_data/camera_diagnostics/<session>.jsonl`; the writer
+copies rows for its recording generation at finalization after capture's boundary
+acknowledgement. Rejections bypass tracking/video publication and retain real time
+gaps. Two seconds without a marker-valid raw JPEG faults on the next returned
+buffer; it is not a watchdog for blocked reads. Payload decode errors remain faults.
 VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside

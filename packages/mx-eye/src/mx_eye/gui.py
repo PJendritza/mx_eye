@@ -295,7 +295,7 @@ class Window(W.QMainWindow):
         self.metrics = label("CAM —  TRACK —  REC —  Tracking skipped —", "muted")
         self.metrics.setFont(G.QFontDatabase.systemFont(G.QFontDatabase.FixedFont))
         self.metrics.setFixedWidth(self.metrics.fontMetrics().horizontalAdvance(
-            "SOURCE 999.9 fps  TRACK 999.9 fps  REC 999.9 fps  Tracking skipped 999999"
+            "SOURCE 999.9 fps  TRACK 999.9 fps  REC 999.9 fps  Tracking skipped 999999  Camera rejected 999999"
         ))
         self.metrics.setToolTip("Acquisition, tracking and recording status")
         metrics_row.addWidget(self.metrics)
@@ -1205,6 +1205,10 @@ class Window(W.QMainWindow):
         self.open_button.setEnabled(not self.pending and not self._closing)
         run = self.service.run
         recording = bool(run and run["recording"].is_set())
+        local_stats = ({key: value.value for key, value in run["stats"].items()}
+                       if run else self.service.last_stats)
+        camera_rejected = int(local_stats.get("camera_rejected", 0))
+        record_camera_rejected = int(local_stats.get("record_camera_rejected", 0))
         draining = bool(run and not recording and not run["writer_done"].is_set())
         self.record_button.setToolTip(self.service.recording_path_info or "Automatic MKV recording: MJPEG copy or lossless FFV1")
         self.record_button.setText("■ Stop recording" if recording else "Finalizing…" if draining else "● Record")
@@ -1218,7 +1222,7 @@ class Window(W.QMainWindow):
             recording_label = "FINALIZING"
         elif state.directory:
             recording_label = "STOPPED" if state.stats.log_fault or state.stats.capture_fault else "SAVED"
-            if recording_label == "SAVED" and state.stats.recording_dropped:
+            if recording_label == "SAVED" and (state.stats.recording_dropped or record_camera_rejected):
                 recording_label = "SAVED WITH SKIPS"
         else:
             recording_label = "NOT RECORDING"
@@ -1227,6 +1231,7 @@ class Window(W.QMainWindow):
             f"{recording_label} · {int(state.stats.written):,} frames written · "
             f"{state.stats.recorded_seconds:.1f} s video · "
             f"{state.stats.recording_dropped:,} recording frames skipped · {backlog_count} frames queued"
+            f" · {record_camera_rejected:,} camera frames rejected in recording"
             + (f" · {Path(state.directory).name}/video.mkv" if state.directory else "")
         )
         self.recording_status.setToolTip(state.directory or str(
@@ -1298,7 +1303,7 @@ class Window(W.QMainWindow):
         metrics_text = (
             f"{'CAM' if mode is SourceMode.CAMERA else 'SOURCE'} {self.rates[0]:5.1f} fps  "
             f"TRACK {self.rates[1]:5.1f} fps  REC {recording_rate_text}  "
-            f"Tracking skipped {int(stats.tracking_skips):6d}"
+            f"Tracking skipped {int(stats.tracking_skips):6d}  Camera rejected {camera_rejected}"
         )
         self.metrics.setToolTip(
             metrics_text + "\nCAM/SOURCE: frames received; TRACK: frames processed; "

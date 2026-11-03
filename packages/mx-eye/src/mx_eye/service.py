@@ -25,6 +25,7 @@ from mx_eye_protocol.control import (
 from .config import MxEyeConfigStore, SourceMode
 from .control_server import ControlServer
 from .experiment_events import EventJournal
+from .paths import data_root
 from .recording import reserve_recording_directory
 from mx_eye_protocol.events import ExperimentEventKind
 from .video import VideoReader
@@ -54,6 +55,8 @@ STAT_NAMES = (
     "processing_us",
     "recorded_seconds",
     "recording_dropped",
+    "camera_rejected",
+    "record_camera_rejected",
 )
 
 
@@ -278,6 +281,7 @@ class Service:
             ready=set(),
         )
         self.session = uuid.uuid4().int & ((1 << 64) - 1)
+        run["camera_diagnostics_path"] = str(data_root() / "camera_diagnostics" / f"{self.session}.jsonl")
         self.revision = 0
         self.priority_info = []
         self.source_info = {}
@@ -328,6 +332,7 @@ class Service:
             capture = c.Process(
                 target=capture_worker,
                 name="mx-eye acquisition",
+                kwargs={"camera_diagnostics_path": run["camera_diagnostics_path"]},
                 args=(
                     config,
                     run["mailbox"],
@@ -393,7 +398,7 @@ class Service:
             raise RuntimeError("Restart tracking after resolving the recording fault.")
         config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
         directory = reserve_recording_directory(Path(config.value.recording.directory))
-        for key in ("enqueued", "written", "record_acquired", "log_fault", "recorded_seconds", "recording_dropped"):
+        for key in ("enqueued", "written", "record_acquired", "log_fault", "recorded_seconds", "recording_dropped", "record_camera_rejected"):
             run["stats"][key].value = 0
         run["recording_stop"].clear()
         run["writer_done"].clear()
@@ -416,6 +421,7 @@ class Service:
             ),
             kwargs={
                 "directory_reserved": True,
+                "camera_diagnostics_path": run["camera_diagnostics_path"],
                 "recording_capture_done": run["recording_capture_done"],
                 "recording_generation": run["recording_generation"].value + 1,
             },

@@ -172,7 +172,25 @@ an independent event journal lives under `mx_eye_data/events`. Shared run and
 visit IDs link these to the framework's `eye_events` log. Use the matching local
 `feature/mx-eye-events` framework branch; its `docs/mx-eye-events.md` contains the
 PC demo commands and limitations. This does not change calibration selection or
-the existing malformed-JPEG error behavior.
+eye-coordinate output.
+
+On the `fix/recover-malformed-jpeg` branch, isolated raw camera JPEG buffers with
+missing start/end markers are rejected for both tracking and recording, while
+acquisition continues. The GUI reports camera rejections separately from tracking
+and recording skips. No replacement sample is emitted; real acquisition timestamps
+preserve the gap. Two seconds without a marker-valid JPEG, checked after each
+returned raw buffer, stops acquisition. A blocked camera read is not interrupted
+by this check, and camera read/disconnection errors still stop acquisition.
+
+Every rejection is saved with wall-clock/monotonic timestamps, reason, byte count,
+buffer shape/type, and first/last bytes in
+`mx_eye_data/camera_diagnostics/<acquisition-session>.jsonl`. On recording
+finalization, that recording's entries are copied to `camera_rejections.jsonl`
+beside the video; `session.json` includes its `camera_rejected` total and source
+diagnostic path. GUI `camera_rejected` is acquisition-wide;
+`record_camera_rejected` resets per recording. A finalized recording with camera
+rejections is `completed_with_skips` and `all_frames_saved` is false. Marker checks
+do not guarantee the JPEG payload is fully decodable; decoder errors remain faults.
 
 Recordings use `video.mkv` with per-frame presentation timestamps derived from
 monotonic host acquisition time. Accessible camera MJPEG packets are copied without

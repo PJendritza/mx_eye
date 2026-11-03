@@ -14,6 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import psutil
+from .camera_diagnostics import CameraPacketGuard, save_recording_rejections
 from mx_eye_protocol.data_frame import (
     DataFrame,
     TrackingFlags,
@@ -209,6 +210,7 @@ def synthetic_frame(index, width, height, fps):
 def capture_worker(
     config, mailbox, ring, stop, done, paused, commands, tracked_frame, stats, events,
     recording=None, recording_stop=None, recording_capture_done=None, recording_generation=None, simulation_state=None,
+    camera_diagnostics_path=None,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
@@ -222,6 +224,7 @@ def capture_worker(
     first_size = None
     encoded = False
     playback_clock = PlaybackClock()
+    jpeg_guard = CameraPacketGuard(camera_diagnostics_path, stats) if camera_diagnostics_path else None
     try:
         mode = source.mode
         if mode is SourceMode.VIDEO:
@@ -355,6 +358,14 @@ def capture_worker(
             acquired_monotonic_ns = time.monotonic_ns()
             acquired = time.time_ns()  # Host read-return time, NOT sensor exposure.
             if ok and mode is SourceMode.CAMERA and encoded:
+                if jpeg_guard is not None and not (first_size is None and frame is not None and frame.ndim == 3):
+                    flat = jpeg_guard.check(
+                        frame, acquired, acquired_monotonic_ns,
+                        generation if recording is not None and recording.is_set() else 0,
+                    )
+                    if flat is None:
+                        continue  # No publication, recording, or fabricated timestamp.
+                    frame = flat
                 flat = frame.reshape(-1)
                 jpeg = (frame.dtype == np.uint8 and flat.size >= 4
                         and tuple(flat[:2]) == (255, 216))
@@ -736,6 +747,7 @@ def writer_worker(
     test_delay=0,
     recording_capture_done=None, recording_generation=0,
     directory_reserved=False,
+    camera_diagnostics_path=None,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
@@ -847,10 +859,18 @@ def writer_worker(
         for file in (frame_file, sample_file):
             if file is not None:
                 file.close()
+        try:
+            save_recording_rejections(camera_diagnostics_path, folder / "camera_rejections.jsonl", recording_generation)
+        except OSError as exc:
+            error = f"Could not save camera diagnostics: {exc}"
+            stats["record_fault"].value = 2
+            report(events, "record_error", message=error)
         summary = dict(
             session=session,
             acquired=int(stats.get("record_acquired", stats["acquired"]).value),
             written=video_index,
+            camera_rejected=int(stats["record_camera_rejected"].value) if "record_camera_rejected" in stats else 0,
+            camera_diagnostics_source=str(camera_diagnostics_path) if camera_diagnostics_path else None,
             recording_dropped=int(stats.get("recording_dropped").value)
                 if "recording_dropped" in stats else 0,
             recording_policy="best_effort_skip_incoming_when_full",
@@ -874,10 +894,10 @@ def writer_worker(
             recorded_span_ns=(last_monotonic - first_monotonic) if last_monotonic is not None else 0,
             camera_driver_drops="not observable through this UVC/OpenCV backend",
         )
-        summary["all_frames_saved"] = bool(summary["complete"] and not summary["recording_dropped"])
+        summary["all_frames_saved"] = bool(summary["complete"] and not summary["recording_dropped"] and not summary["camera_rejected"])
         summary["recording_result"] = (
             "failed" if not summary["complete"] or not summary["tracking_log_complete"]
-            else "completed_with_skips" if summary["recording_dropped"] else "completed"
+            else "completed_with_skips" if summary["recording_dropped"] or summary["camera_rejected"] else "completed"
         )
         try:
             (folder / "session.json").write_text(

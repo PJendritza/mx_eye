@@ -38,8 +38,9 @@ def test_rejection_timeout_resets_after_good_packet(tmp_path):
     assert all(row["reason"] == "missing_jpeg_end" for row in rows)
 
 
+@pytest.mark.parametrize("scenario", ["normal", "grayscale", "start_first", "start_later"])
 def test_capture_skips_bad_packets_before_and_after_initialization(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, scenario
 ):
     from mx_eye import pipeline
 
@@ -49,8 +50,14 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
     config.value.source.fourcc = "MJPG"
     good = cv2.imencode(".jpg", np.zeros((48, 48, 3), np.uint8))[1].reshape(-1)
     buffers = [np.array([], np.uint8), good, good[:-2], good]
+    if scenario == "grayscale":
+        buffers = [np.zeros((48, 48), np.uint8)] * 2
     stop, done, recording = threading.Event(), threading.Event(), threading.Event()
     recording.set()
+    recording_generation = SimpleNamespace(value=3 if scenario == "start_later" else 0 if scenario == "start_first" else 1)
+    if scenario.startswith("start_"):
+        recording.clear()
+    reads = 0
     cap = Mock()
     cap.set.return_value = cap.isOpened.return_value = True
     cap.get.side_effect = lambda prop: (
@@ -58,6 +65,11 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
     )
 
     def read():
+        nonlocal reads
+        reads += 1
+        if scenario.startswith("start_") and reads == 3:
+            recording_generation.value += 1
+            recording.set()
         frame = buffers.pop(0)
         if not buffers:
             stop.set()
@@ -91,11 +103,24 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
         stats,
         queue.Queue(),
         recording=recording,
-        recording_generation=SimpleNamespace(value=1),
+        recording_generation=recording_generation,
         camera_diagnostics_path=path,
     )
     assert done.is_set()
     assert stats["capture_fault"].value == 0
+    if scenario == "grayscale":
+        assert stats["camera_rejected"].value == 0
+        assert not path.exists()
+        assert mailbox.put.call_count == ring.put.call_count == 1
+        assert ring.put.call_args.args[0].shape == (48, 48, 3)
+        cap.set.assert_any_call(cv2.CAP_PROP_CONVERT_RGB, 1)
+        return
+    if scenario.startswith("start_"):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [row["recording_generation"] for row in rows] == [0, recording_generation.value]
+        assert stats["record_camera_rejected"].value == 1
+        assert ring.put.call_count == 1
+        return
     assert stats["camera_rejected"].value == stats["record_camera_rejected"].value == 2
     assert mailbox.put.call_count == ring.put.call_count == 2
     metadata = [call.args[1] for call in ring.put.call_args_list]

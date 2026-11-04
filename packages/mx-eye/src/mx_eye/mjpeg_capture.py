@@ -11,6 +11,24 @@ import cv2
 import numpy as np
 
 
+def dshow_device(source, names=None):
+    """Keep the selected index when friendly names are duplicated."""
+    if names is None:
+        from pygrabber.dshow_graph import FilterGraph
+
+        names = FilterGraph().get_input_devices()
+    index = source.get("camera", 0)
+    name = source.get("camera_name")
+    if name and names.count(name) == 1:
+        return name, 0  # A uniquely named device may have moved to another index.
+    if not 0 <= index < len(names) or (name and names[index] != name):
+        raise RuntimeError(
+            "Selected camera is missing or ambiguous. Refresh Camera Settings and select it again."
+        )
+    name = names[index]
+    return name, names[:index].count(name)
+
+
 class PacketPipe:
     """Expose read-only streaming I/O; Windows pipe seek() is not usable."""
 
@@ -34,11 +52,7 @@ class MjpegCapture:
             raise RuntimeError(
                 "MJPEG capture on Windows requires ffmpeg on PATH. Install FFmpeg or select MSMF for the decoded FFV1 fallback."
             )
-        name = source.get("camera_name")
-        if not name:
-            from pygrabber.dshow_graph import FilterGraph
-
-            name = FilterGraph().get_input_devices()[source["camera"]]
+        name, occurrence = dshow_device(source)
         command = [
             executable,
             "-hide_banner",
@@ -53,6 +67,8 @@ class MjpegCapture:
             str(source["fps"]),
             "-vcodec",
             "mjpeg",
+            "-video_device_number",
+            str(occurrence),
             "-i",
             f"video={name}",
             "-map",

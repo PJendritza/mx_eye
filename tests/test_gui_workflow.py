@@ -119,6 +119,10 @@ def test_recording_overload_skips_frames_and_preserves_timing(monkeypatch, tmp_p
         with (directory / "frames.csv").open(newline="") as stream:
             rows = list(csv.DictReader(stream))
         ids = [int(row["source_frame"]) for row in rows]
+        with (directory / "tracking.csv").open(newline="") as stream:
+            tracking_rows = list(csv.DictReader(stream))
+        assert tracking_rows
+        assert {int(row["source_frame"]) for row in tracking_rows} <= set(ids)
         assert any(b - a > 1 for a, b in zip(ids, ids[1:]))
         times = [int(row["acquisition_monotonic_ns"]) for row in rows]
         assert all(b > a for a, b in zip(times, times[1:]))

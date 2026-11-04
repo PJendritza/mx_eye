@@ -5,6 +5,7 @@ import logging
 import time
 from pathlib import Path
 
+import av
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -18,8 +19,12 @@ class CameraPacketGuard:
         self.stats = stats
         self.last_good_ns = time.monotonic_ns()
         self.attempt = 0
+        self.decoder = av.CodecContext.create("mjpeg", "r")
+        self.decoder.options = {"err_detect": "explode"}
 
-    def check(self, frame, acquired_ns, monotonic_ns, recording_generation=0):
+    def check(
+        self, frame, acquired_ns, monotonic_ns, recording_generation=0, mark_good=True
+    ):
         self.attempt += 1
         flat = (
             frame.reshape(-1)
@@ -38,9 +43,42 @@ class CameraPacketGuard:
             if end < 2:
                 reason = "missing_jpeg_end"
         if reason is None:
-            self.last_good_ns = monotonic_ns
+            if mark_good:
+                self.last_good_ns = monotonic_ns
             return flat[: end + 2]
 
+        return self.reject(
+            frame, acquired_ns, monotonic_ns, recording_generation, reason
+        )
+
+    def validate(self, frame, acquired_ns, monotonic_ns, recording_generation=0):
+        packet = self.check(
+            frame, acquired_ns, monotonic_ns, recording_generation, mark_good=False
+        )
+        if packet is None:
+            return None
+        try:
+            frames = self.decoder.decode(av.Packet(packet.tobytes()))
+            if len(frames) != 1:
+                raise ValueError("JPEG did not decode to one image")
+            pixels = frames[0].to_ndarray(format="bgr24")
+        except (av.FFmpegError, ValueError) as exc:
+            return self.reject(
+                packet,
+                acquired_ns,
+                monotonic_ns,
+                recording_generation,
+                f"jpeg_decode_failed: {exc}",
+            )
+        self.last_good_ns = monotonic_ns
+        return packet, pixels
+
+    def reject(self, frame, acquired_ns, monotonic_ns, recording_generation, reason):
+        flat = (
+            frame.reshape(-1)
+            if isinstance(frame, np.ndarray)
+            else np.array([], dtype=np.uint8)
+        )
         self.stats["camera_rejected"].value += 1
         if recording_generation:
             self.stats["record_camera_rejected"].value += 1
@@ -67,7 +105,6 @@ class CameraPacketGuard:
             raise RuntimeError(
                 "No valid camera JPEG for two seconds; acquisition stopped. Check camera diagnostics."
             )
-        return None
 
 
 def save_recording_rejections(source, destination, generation):

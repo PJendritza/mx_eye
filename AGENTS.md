@@ -99,7 +99,9 @@ OpenCV receives UVC cameras; Raspberry Pi CSI/libcamera capture is not implement
 ## What runs independently
 
 1. **Acquisition process:** reads the source and timestamps each returned frame.
-   Publishes the latest frame to tracking before offering it to recording.
+   Validates/decodes raw JPEG packets once. While recording, offers their original
+   bytes to the FIFO before publishing decoded pixels to tracking; full-FIFO
+   frames are skipped for both consumers.
 2. **Tracking process:** v13 pupil/CR and template logic, then nonblocking sample
    transmission. It does no GUI rendering, video encoding, or disk writing.
 3. **Recording process:** consumes a separate bounded FIFO, encodes full frames,
@@ -164,13 +166,18 @@ Completion checks require acquired = written + skipped and enqueued = written,
 and reopen the video to check readability. `complete` means orderly finalization
 with all frames accounted for; `all_frames_saved` additionally requires no skips.
 `recording_result` distinguishes `completed`, `completed_with_skips`, and `failed`.
-Camera marker rejections are counted separately in `camera_rejected` in the
+Camera marker/decoder rejections are counted separately in `camera_rejected` in the
 recording summary and also make `all_frames_saved` false. Capture logs each
 rejection directly to `mx_eye_data/camera_diagnostics/<session>.jsonl`; the writer
 copies rows for its recording generation at finalization after capture's boundary
 acknowledgement. Rejections bypass tracking/video publication and retain real time
-gaps. Two seconds without a marker-valid raw JPEG faults on the next returned
-buffer; it is not a watchdog for blocked reads. Payload decode errors remain faults.
+gaps. Two seconds without a decoder-accepted raw JPEG faults on the next returned
+buffer; it is not a watchdog for blocked reads. Payload decode errors use the
+same rejection/recovery policy. Windows DirectShow MJPEG uses external FFmpeg
+stream copy through NUT/pipe framing; Linux uses raw V4L2 packets. Only the Windows
+path requires the FFmpeg executable. Explicit Windows exposure/gain controls
+retain the OpenCV decoded fallback. Internal mailbox metadata includes recording
+generation to avoid logging a pre-recording preview into a new recording.
 VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside

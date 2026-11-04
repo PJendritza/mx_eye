@@ -358,10 +358,16 @@ def capture_worker(
             acquired_monotonic_ns = time.monotonic_ns()
             acquired = time.time_ns()  # Host read-return time, NOT sensor exposure.
             if ok and mode is SourceMode.CAMERA and encoded:
-                if jpeg_guard is not None and not (first_size is None and frame is not None and frame.ndim == 3):
+                decoded_start = (first_size is None and isinstance(frame, np.ndarray)
+                                 and (frame.ndim == 3 or (frame.ndim == 2 and min(frame.shape) > 1)))
+                if jpeg_guard is not None and not decoded_start:
+                    # Recording may have started while the device read blocked.
+                    with recording_generation.get_lock() if hasattr(recording_generation, "get_lock") else contextlib.nullcontext():
+                        rejection_generation = (recording_generation.value
+                                                if recording_generation is not None and recording is not None and recording.is_set() else 0)
                     flat = jpeg_guard.check(
                         frame, acquired, acquired_monotonic_ns,
-                        generation if recording is not None and recording.is_set() else 0,
+                        rejection_generation,
                     )
                     if flat is None:
                         continue  # No publication, recording, or fabricated timestamp.

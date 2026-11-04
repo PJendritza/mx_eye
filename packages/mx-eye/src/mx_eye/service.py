@@ -382,7 +382,8 @@ class Service:
         if not run or self.state != "running" or run["ring"] is None:
             raise RuntimeError("Start camera or simulation tracking before recording.")
         if not enabled:
-            run["recording"].clear()
+            with run["recording_generation"].get_lock():
+                run["recording"].clear()
             run["recording_stop"].set()
             return self.snapshot()
         if run["recording"].is_set():
@@ -447,7 +448,8 @@ class Service:
             if writer.pid is None:
                 run["writer_done"].set()
             raise
-        run["recording"].set()
+        with run["recording_generation"].get_lock():
+            run["recording"].set()
         return self.snapshot()
 
     def _stop(self):

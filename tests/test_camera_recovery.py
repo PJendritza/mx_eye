@@ -18,6 +18,19 @@ def counters():
     return {name: SimpleNamespace(value=0) for name in (*STAT_NAMES, "record_acquired")}
 
 
+def test_validated_monochrome_jpeg_keeps_original_bytes(tmp_path):
+    gray = np.tile(np.arange(48, dtype=np.uint8), (48, 1))
+    original = cv2.imencode(".jpg", gray)[1].reshape(-1)
+    guard = CameraPacketGuard(tmp_path / "diagnostics.jsonl", counters())
+    result = guard.validate(original, 100, guard.last_good_ns + 1_000_000)
+    assert result is not None
+    packet, pixels = result
+    np.testing.assert_array_equal(packet, original)
+    np.testing.assert_array_equal(pixels[:, :, 0], pixels[:, :, 1])
+    np.testing.assert_array_equal(pixels[:, :, 1], pixels[:, :, 2])
+    assert not guard.path.exists()
+
+
 def test_rejection_timeout_resets_after_good_packet(tmp_path):
     stats = counters()
     guard = CameraPacketGuard(tmp_path / "diagnostics.jsonl", stats)
@@ -38,7 +51,17 @@ def test_rejection_timeout_resets_after_good_packet(tmp_path):
     assert all(row["reason"] == "missing_jpeg_end" for row in rows)
 
 
-@pytest.mark.parametrize("scenario", ["normal", "grayscale", "start_first", "start_later"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "normal",
+        "grayscale",
+        "start_first",
+        "start_later",
+        "buffer_full",
+        "decode_error",
+    ],
+)
 def test_capture_skips_bad_packets_before_and_after_initialization(
     tmp_path, monkeypatch, scenario
 ):
@@ -50,11 +73,15 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
     config.value.source.fourcc = "MJPG"
     good = cv2.imencode(".jpg", np.zeros((48, 48, 3), np.uint8))[1].reshape(-1)
     buffers = [np.array([], np.uint8), good, good[:-2], good]
+    if scenario == "decode_error":
+        buffers[2] = np.array([255, 216, 0, 0, 255, 217], np.uint8)
     if scenario == "grayscale":
         buffers = [np.zeros((48, 48), np.uint8)] * 2
     stop, done, recording = threading.Event(), threading.Event(), threading.Event()
     recording.set()
-    recording_generation = SimpleNamespace(value=3 if scenario == "start_later" else 0 if scenario == "start_first" else 1)
+    recording_generation = SimpleNamespace(
+        value=3 if scenario == "start_later" else 0 if scenario == "start_first" else 1
+    )
     if scenario.startswith("start_"):
         recording.clear()
     reads = 0
@@ -89,6 +116,8 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
     mailbox.put.return_value = True
     ring = Mock()
     ring.put.return_value = True
+    if scenario == "buffer_full":
+        ring.put.side_effect = [False, True]
     stats = counters()
     path = tmp_path / "diagnostics.jsonl"
     capture_worker(
@@ -117,12 +146,23 @@ def test_capture_skips_bad_packets_before_and_after_initialization(
         return
     if scenario.startswith("start_"):
         rows = [json.loads(line) for line in path.read_text().splitlines()]
-        assert [row["recording_generation"] for row in rows] == [0, recording_generation.value]
+        assert [row["recording_generation"] for row in rows] == [
+            0,
+            recording_generation.value,
+        ]
         assert stats["record_camera_rejected"].value == 1
         assert ring.put.call_count == 1
         return
+    if scenario == "buffer_full":
+        assert ring.put.call_count == 2
+        assert mailbox.put.call_count == 1
+        assert stats["recording_dropped"].value == 1
+        assert stats["enqueued"].value == 1
+        return
     assert stats["camera_rejected"].value == stats["record_camera_rejected"].value == 2
     assert mailbox.put.call_count == ring.put.call_count == 2
+    assert mailbox.put.call_args.args[0].shape == (48, 48, 3)
+    np.testing.assert_array_equal(ring.put.call_args.args[0], good)
     metadata = [call.args[1] for call in ring.put.call_args_list]
     assert [row[3] for row in metadata] == [10_020_000_000, 10_040_000_000]
     assert stats["record_acquired"].value == stats["enqueued"].value == 2

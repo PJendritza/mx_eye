@@ -66,7 +66,14 @@ and provenance. The workspace members live in `packages/mx-eye`,
 - Click section headings to collapse/expand sliders. Numeric boxes accept typed
   values as well as small increments. The controls scroll when space is tight.
 - **Settings:** camera index, requested mode/FPS, network addresses/ports, recording
-  location, buffer size, and codec. Changes require a stopped session.
+  location and buffer size require a stopped session. Exposure, gain and software
+  image brightness apply automatically (200 ms debounce). Settings is non-modal,
+  follows Start/Stop, and flushes pending live edits on close/before Start.
+  Other settings still use Save. A null source gain applies the camera's
+  advertised default; an explicit zero stays zero. Windows uses native DirectShow
+  controls and Linux uses V4L2. Brightness (0.1–4×, default 1×) affects tracking
+  and preview, never acquisition/recording pixels. tracking.csv appends the exact
+  multiplier per processed source frame; config.json also saves the initial value.
 - **Visible controls:** Source, Start/Stop (or Open video), and independent Record
   occupy the first row; Suspend displays is below. Source name and relevant FPS
   share the information row. Playback controls stay beside the timeline.
@@ -86,7 +93,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
   every worker process receives a per-session copy.
 - **Menus:** File handles configuration/template loading and saving, video opening
   and Exit. Settings contains Camera, Network, Recording and View. View refresh
-  rate and overlays can change live; other settings require a stopped session.
+  rate, overlays, exposure, gain and image brightness can change live.
   Tools contains optional diagnostics from existing counters and GUI timing only
   while open. Calibration is a placeholder.
 
@@ -99,7 +106,9 @@ OpenCV receives UVC cameras; Raspberry Pi CSI/libcamera capture is not implement
 ## What runs independently
 
 1. **Acquisition process:** reads the source and timestamps each returned frame.
-   Publishes the latest frame to tracking before offering it to recording.
+   Validates/decodes raw JPEG packets once. While recording, offers their original
+   bytes to the FIFO before publishing decoded pixels to tracking; full-FIFO
+   frames are skipped for both consumers.
 2. **Tracking process:** v13 pupil/CR and template logic, then nonblocking sample
    transmission. It does no GUI rendering, video encoding, or disk writing.
 3. **Recording process:** consumes a separate bounded FIFO, encodes full frames,
@@ -138,6 +147,7 @@ Each recording gets a unique subfolder under the configured output directory:
 | `tracking.csv` | Every locally logged tracking sample, with timestamps, coordinates and flags |
 | `config.json` | Configuration at session start |
 | `session.json` | Final counts, completion status and any detected fault |
+| `camera_rejections.jsonl` | Timestamped malformed raw JPEG buffers rejected during this recording |
 
 `video.mkv` embeds acquisition-relative monotonic timestamps. `frames.csv` also
 stores full-resolution monotonic and synchronized wall-clock acquisition times.
@@ -147,11 +157,11 @@ Parameter adjustments during acquisition affect tracking.csv; config.json record
 settings at recording start only. Save the final configuration separately if needed.
 
 The configurable memory budget is a finite buffer, not an unlimited guarantee.
-If the writer cannot keep up and that buffer fills, recording stops accepting new
-frames, the queued prefix is finalized, and the session is marked incomplete.
-**Tracking continues.** A disk/write fault is similarly visible. Restart a new
-session after resolving the fault. It is impossible to guarantee both unlimited
-lossless recording and nonblocking tracking on a stalled disk with finite RAM.
+If the writer cannot keep up and that buffer fills, incoming video frames are
+skipped and counted in `recording_dropped`; recording and tracking continue.
+Saved frames retain their acquisition timestamps, including gaps. The GUI shows
+recording skips separately from tracking skips. A disk/write fault still stops
+recording and marks the session incomplete; restart tracking after resolving it.
 
 Stop initiates orderly shutdown and buffer draining. Wait for IDLE or ERROR before
 starting another session or removing the disk. Closing the tracker waits for this.
@@ -159,8 +169,23 @@ A hung camera is forcibly stopped after 5 seconds; hung tracking/writing after
 30 seconds. Forced termination marks the session incomplete. After abrupt power
 loss, a missing session.json must also be treated as an incomplete session.
 
-Completion checks compare recording-acquired/enqueued/written counts and reopen
-the video to check readability. VFR header frame-count estimates are not used to
+Completion checks require acquired = written + skipped and enqueued = written,
+and reopen the video to check readability. `complete` means orderly finalization
+with all frames accounted for; `all_frames_saved` additionally requires no skips.
+`recording_result` distinguishes `completed`, `completed_with_skips`, and `failed`.
+Camera marker/decoder rejections are counted separately in `camera_rejected` in the
+recording summary and also make `all_frames_saved` false. Capture logs each
+rejection directly to `mx_eye_data/camera_diagnostics/<session>.jsonl`; the writer
+copies rows for its recording generation at finalization after capture's boundary
+acknowledgement. Rejections bypass tracking/video publication and retain real time
+gaps. Two seconds without a decoder-accepted raw JPEG faults on the next returned
+buffer; it is not a watchdog for blocked reads. Payload decode errors use the
+same rejection/recovery policy. Windows DirectShow MJPEG uses external FFmpeg
+stream copy through NUT/pipe framing; Linux uses raw V4L2 packets. Only the Windows
+path requires the FFmpeg executable. Windows exposure/gain uses native controls
+without switching away from packet capture. Internal mailbox metadata includes recording
+generation to avoid logging a pre-recording preview into a new recording.
+VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside
 the camera or USB driver. `tracking_log_complete` separately reports log overflow.

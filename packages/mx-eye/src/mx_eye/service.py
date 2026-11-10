@@ -2,7 +2,6 @@
 
 import base64
 import concurrent.futures
-import datetime
 import json
 import multiprocessing as mp
 import queue
@@ -25,6 +24,10 @@ from mx_eye_protocol.control import (
 
 from .config import MxEyeConfigStore, SourceMode
 from .control_server import ControlServer
+from .experiment_events import EventJournal
+from .paths import data_root
+from .recording import reserve_recording_directory
+from mx_eye_protocol.events import ExperimentEventKind
 from .video import VideoReader
 from .pipeline import (
     FrameRing,
@@ -50,6 +53,10 @@ STAT_NAMES = (
     "source_fps",
     "source_index",
     "processing_us",
+    "recorded_seconds",
+    "recording_dropped",
+    "camera_rejected",
+    "record_camera_rejected",
 )
 
 
@@ -79,6 +86,9 @@ class Service:
         self.priority_info = []
         self._server_errors = []
         self._server = None
+        self.experiment_events = EventJournal()
+        self._event_visit = None
+        self._event_directory = None
         self._owner = threading.Thread(
             target=self._supervise, daemon=True, name="mx-eye supervisor"
         )
@@ -131,6 +141,11 @@ class Service:
                 source=SourceStatus.model_validate(self.source_info),
                 priority=list(self.priority_info),
                 server_errors=list(self._server_errors),
+                recording=bool(run and run["recording"].is_set()),
+                recording_finalizing=bool(run and not run["recording"].is_set()
+                                          and not run["writer_done"].is_set()),
+                experiment_event=self.experiment_events.latest,
+                event_log=self.experiment_events.path,
             )
 
     def preview(self):
@@ -178,7 +193,35 @@ class Service:
     def _dispatch_request(self, request: ControlRequest) -> ControlReply:
         if request.command is Command.STATUS:
             return ControlReply(status=self.snapshot())
-        return ControlReply(status=self.submit(request.command).result(timeout=15))
+        args = {"event": request.experiment_event} if request.experiment_event else {}
+        return ControlReply(status=self.submit(request.command, **args).result(timeout=15))
+
+    def _experiment_event(self, event):
+        if self.experiment_events.contains(event):
+            return self.snapshot()
+        owner = (event.run_id, event.visit_id)
+        kind = event.kind
+        if kind is ExperimentEventKind.ANIMAL_ENTERED and event.control_recording:
+            if not event.visit_id:
+                raise ValueError("Recording requires a visit_id")
+            if self._event_visit is not None and self._event_visit != owner:
+                raise RuntimeError("End the current animal visit before starting another")
+            if self._event_visit is None:
+                if self.run and self.run["recording"].is_set():
+                    raise RuntimeError("Stop the manual recording before enabling animal recording")
+                self._record(True)
+                self._event_visit, self._event_directory = owner, self.directory
+                (Path(self.directory) / "experiment.json").write_text(
+                    event.model_dump_json(indent=2), encoding="utf-8"
+                )
+        directory = self._event_directory if owner == self._event_visit else None
+        self.experiment_events.save(event, directory)
+        if kind in (ExperimentEventKind.ANIMAL_LEFT, ExperimentEventKind.RUN_ENDED,
+                    ExperimentEventKind.DETECTOR_FAULT) and owner == self._event_visit:
+            if self.run and self.state == "running":
+                self._record(False)
+            self._event_visit = self._event_directory = None
+        return self.snapshot()
 
     def _start(self):
         if self.run:
@@ -238,6 +281,7 @@ class Service:
             ready=set(),
         )
         self.session = uuid.uuid4().int & ((1 << 64) - 1)
+        run["camera_diagnostics_path"] = str(data_root() / "camera_diagnostics" / f"{self.session}.jsonl")
         self.revision = 0
         self.priority_info = []
         self.source_info = {}
@@ -288,6 +332,7 @@ class Service:
             capture = c.Process(
                 target=capture_worker,
                 name="mx-eye acquisition",
+                kwargs={"camera_diagnostics_path": run["camera_diagnostics_path"]},
                 args=(
                     config,
                     run["mailbox"],
@@ -337,7 +382,8 @@ class Service:
         if not run or self.state != "running" or run["ring"] is None:
             raise RuntimeError("Start camera or simulation tracking before recording.")
         if not enabled:
-            run["recording"].clear()
+            with run["recording_generation"].get_lock():
+                run["recording"].clear()
             run["recording_stop"].set()
             return self.snapshot()
         if run["recording"].is_set():
@@ -351,17 +397,14 @@ class Service:
             previous.join()
         if run["stats"]["record_fault"].value:
             raise RuntimeError("Restart tracking after resolving the recording fault.")
-        for key in ("enqueued", "written", "record_acquired", "log_fault"):
+        config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
+        directory = reserve_recording_directory(Path(config.value.recording.directory))
+        for key in ("enqueued", "written", "record_acquired", "log_fault", "recorded_seconds", "recording_dropped", "record_camera_rejected"):
             run["stats"][key].value = 0
         run["recording_stop"].clear()
         run["writer_done"].clear()
         run["ready"].discard("writer_ready")
-        config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.directory = str(
-            Path(config.value.recording.directory).expanduser().resolve()
-            / f"{stamp}_{self.session:016x}"
-        )
+        self.directory = str(directory)
         writer = self.ctx.Process(
             target=writer_worker,
             name="mx-eye recording",
@@ -378,6 +421,8 @@ class Service:
                 run["events"],
             ),
             kwargs={
+                "directory_reserved": True,
+                "camera_diagnostics_path": run["camera_diagnostics_path"],
                 "recording_capture_done": run["recording_capture_done"],
                 "recording_generation": run["recording_generation"].value + 1,
             },
@@ -403,7 +448,8 @@ class Service:
             if writer.pid is None:
                 run["writer_done"].set()
             raise
-        run["recording"].set()
+        with run["recording_generation"].get_lock():
+            run["recording"].set()
         return self.snapshot()
 
     def _stop(self):
@@ -523,6 +569,8 @@ class Service:
                     data = json.loads(path.read_text()) if path.exists() else {}
                     data.update(
                         complete=False,
+                        all_frames_saved=False,
+                        recording_result="failed",
                         supervisor_message=self.message,
                         stats=self.last_stats,
                     )
@@ -536,6 +584,12 @@ class Service:
             self.run = None
 
     def _execute(self, command, args):
+        if command == Command.EXPERIMENT_EVENT:
+            return self._experiment_event(args["event"])
+        if command == Command.RECORDING_START:
+            return self._record(True)
+        if command == Command.RECORDING_STOP:
+            return self._record(False)
         if command == "simulation":
             if self.run and self.config.value.source.mode is SourceMode.SIMULATION:
                 state = self.run["simulation"]
@@ -569,6 +623,25 @@ class Service:
                 self._start_server()
                 if self._server_errors:
                     raise RuntimeError("; ".join(self._server_errors))
+            return self.snapshot()
+        if command == 'camera_controls':
+            controls = args['controls']
+            allowed = {'exposure_mode', 'exposure_ms', 'gain'}
+            if set(controls) - allowed:
+                raise ValueError('Only exposure and gain can change during acquisition.')
+            check = MxEyeConfigStore(self.config.value.model_copy(deep=True))
+            check.value.source = check.value.source.model_copy(update=controls)
+            # Validate updates rather than relying on model_copy's unchecked update.
+            check = MxEyeConfigStore(type(check.value).model_validate(check.value.model_dump()))
+            check.value.tracking.image_brightness = args['image_brightness']
+            if self.run:
+                if self.config.value.source.mode is not SourceMode.CAMERA:
+                    raise ValueError('Live camera controls require a running camera source.')
+                self.run['capture_commands'].put_nowait(dict(command=command, controls=controls))
+                self.revision += 1
+                self.run['commands'].put_nowait(dict(command='config', revision=self.revision,
+                                                     tracking=check.value.tracking.model_copy(deep=True)))
+            self.config.replace(check.value)
             return self.snapshot()
         if command == "config":
             check = MxEyeConfigStore(self.config.value.model_copy(deep=True))

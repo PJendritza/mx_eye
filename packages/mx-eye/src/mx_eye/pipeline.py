@@ -14,6 +14,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import psutil
+from .camera_diagnostics import CameraPacketGuard, save_recording_rejections
+from .mjpeg_capture import MjpegCapture
+from .paths import data_root
 from mx_eye_protocol.data_frame import (
     DataFrame,
     TrackingFlags,
@@ -24,7 +27,7 @@ from .config import (
     SourceMode,
     TrackingMode,
 )
-from .recording import TRACKING_COLUMNS, tracking_row
+from .recording import TRACKING_COLUMNS, recorded_tracking_row
 from .recording import TimestampedVideoWriter
 from .camera_backend import backend_for, camera_target, apply_controls
 from .config import TrackingConfig
@@ -40,8 +43,8 @@ class Mailbox:
     def __init__(self, ctx, max_bytes):
         self.pixels = ctx.RawArray("B", max_bytes)
         self.meta = ctx.RawArray(
-            "q", 7
-        )  # frame, acquisition, media, source index, navigation ID, h, w
+            "q", 8
+        )  # frame, acquisition, media, source index, navigation ID, recording generation, h, w
         self.lock = ctx.Lock()
 
     def put(self, frame, meta):
@@ -59,13 +62,13 @@ class Mailbox:
         if not self.lock.acquire(False):
             return None
         try:
-            fid, acquired, media, source_index, navigation_id, h, w = self.meta[:]
+            fid, acquired, media, source_index, navigation_id, record_generation, h, w = self.meta[:]
             if fid <= after:
                 return None
             pixels = np.frombuffer(self.pixels, np.uint8)
             frame = (pixels[:w].copy() if h == -1 else
                      pixels[:h * w * 3].reshape(h, w, 3).copy())
-            return frame, (fid, acquired, media, source_index, navigation_id)
+            return frame, (fid, acquired, media, source_index, navigation_id, record_generation)
         finally:
             self.lock.release()
 
@@ -209,12 +212,14 @@ def synthetic_frame(index, width, height, fps):
 def capture_worker(
     config, mailbox, ring, stop, done, paused, commands, tracked_frame, stats, events,
     recording=None, recording_stop=None, recording_capture_done=None, recording_generation=None, simulation_state=None,
+    camera_diagnostics_path=None,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
     report(events, "priority", message=priority("capture"))
     source = config.value.source
     cap = None
+    native_controls = None
     reader = None
     navigation_id = 0
     fid = index = 0
@@ -222,6 +227,7 @@ def capture_worker(
     first_size = None
     encoded = False
     playback_clock = PlaybackClock()
+    jpeg_guard = CameraPacketGuard(camera_diagnostics_path or data_root() / "camera_diagnostics" / f"{time.time_ns()}.jsonl", stats)
     try:
         mode = source.mode
         if mode is SourceMode.VIDEO:
@@ -231,7 +237,9 @@ def capture_worker(
         elif mode is SourceMode.CAMERA:
             camera_settings = source.model_dump(mode="json")
             backend = backend_for(camera_settings)
-            cap = cv2.VideoCapture(camera_target(camera_settings), backend)
+            packet_capture = (os.name == "nt" and backend == cv2.CAP_DSHOW
+                              and source.fourcc in ("MJPG", "JPEG"))
+            cap = MjpegCapture(camera_settings, stop=stop) if packet_capture else cv2.VideoCapture(camera_target(camera_settings), backend)
             requests = [
                 ('width', cv2.CAP_PROP_FRAME_WIDTH, source.width),
                 ('height', cv2.CAP_PROP_FRAME_HEIGHT, source.height),
@@ -245,13 +253,20 @@ def capture_worker(
             if not cap.isOpened():
                 raise RuntimeError("Cannot open camera. Check camera index/backend.")
             try:
-                report(events, "source", camera_controls=apply_controls(cap, camera_settings))
+                if os.name == 'nt':
+                    from .windows_camera_controls import WindowsCameraControls
+                    native_controls = WindowsCameraControls(source.camera)
+                report(events, "source", camera_controls=apply_controls(cap, camera_settings, native_controls))
             except Exception as exc:
                 report(events, "source", camera_controls=f"Camera control request failed: {exc}")
             # V4L2 can expose original JPEG packets. Other backends deliver decoded
             # pixels, which are recorded losslessly with FFV1.
-            if backend == cv2.CAP_V4L2 and source.fourcc in ("MJPG", "JPEG"):
+            if packet_capture:
+                encoded = True
+            elif backend == cv2.CAP_V4L2 and source.fourcc in ("MJPG", "JPEG"):
                 encoded = bool(cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))
+            if not encoded:
+                report(events, "source", recording_path="FFV1 fallback · decoded camera frames")
             reported_fps = cap.get(cv2.CAP_PROP_FPS)
             fps = reported_fps if math.isfinite(reported_fps) and 1 <= reported_fps <= 1000 else source.fps
             total = 0
@@ -290,6 +305,13 @@ def capture_worker(
             try:
                 while True:
                     cmd = commands.get_nowait()
+                    if mode is SourceMode.CAMERA and cmd['command'] == 'camera_controls':
+                        camera_settings.update(cmd['controls'])
+                        try:
+                            reply = apply_controls(cap, camera_settings, native_controls)
+                        except Exception as exc:
+                            reply = f'Camera control request failed: {exc}'
+                        report(events, 'source', camera_controls=reply)
                     if mode is SourceMode.VIDEO and cmd["command"] == "speed":
                         source.speed = cmd["speed"]
                         playback_clock.reset()
@@ -354,34 +376,33 @@ def capture_worker(
                 ok, frame = cap.read()
             acquired_monotonic_ns = time.monotonic_ns()
             acquired = time.time_ns()  # Host read-return time, NOT sensor exposure.
+            if not ok and stop.is_set():
+                break
+            recording_image = None
             if ok and mode is SourceMode.CAMERA and encoded:
-                flat = frame.reshape(-1)
-                jpeg = (frame.dtype == np.uint8 and flat.size >= 4
-                        and tuple(flat[:2]) == (255, 216))
-                if jpeg and tuple(flat[-2:]) != (255, 217):
-                    end = flat.tobytes().rfind(b"\xff\xd9")
-                    jpeg = end >= 2
-                    flat = flat[:end + 2]
-                if first_size is None:
-                    probe = cv2.imdecode(flat, cv2.IMREAD_COLOR) if jpeg and flat.size <= len(mailbox.pixels) else None
-                    if probe is None:
-                        encoded = False
-                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-                        ok, frame = cap.read()
-                        acquired_monotonic_ns = time.monotonic_ns()
-                        acquired = time.time_ns()
-                        report(events, "source", recording_path="FFV1 · lossless encoding of decoded frames")
-                    else:
-                        first_size = probe.shape
-                        if probe.shape[:2] != (source.height, source.width):
-                            mode_warnings.append(f"Camera delivered {probe.shape[1]}×{probe.shape[0]}; requested {source.width}×{source.height}")
-                            report(events, "source", camera_mode_info=" · ".join(mode_warnings))
-                        report(events, "dimensions", width=probe.shape[1], height=probe.shape[0])
-                        report(events, "source", recording_path="Original camera MJPEG · no re-encoding")
-                elif not jpeg:
-                    raise RuntimeError("Camera stopped returning complete JPEG packets.")
-                if encoded:
-                    frame = flat
+                decoded_start = (first_size is None and isinstance(frame, np.ndarray)
+                                 and (frame.ndim == 3 or (frame.ndim == 2 and min(frame.shape) > 1)))
+                if not decoded_start:
+                    # Recording may have started while the device read blocked.
+                    with recording_generation.get_lock() if hasattr(recording_generation, "get_lock") else contextlib.nullcontext():
+                        rejection_generation = (recording_generation.value
+                                                if recording_generation is not None and recording is not None and recording.is_set() else 0)
+                    validated = jpeg_guard.validate(
+                        frame, acquired, acquired_monotonic_ns,
+                        rejection_generation,
+                    )
+                    if validated is None:
+                        continue  # No publication, recording, or fabricated timestamp.
+                    recording_image, frame = validated
+                    if first_size is None:
+                        report(events, "source", recording_path="Validated original MJPEG · no re-encoding")
+                else:
+                    encoded = False
+                    cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+                    ok, frame = cap.read()
+                    acquired_monotonic_ns = time.monotonic_ns()
+                    acquired = time.time_ns()
+                    report(events, "source", recording_path="FFV1 fallback · decoded camera frames")
             if not ok:
                 if mode is SourceMode.CAMERA:
                     raise RuntimeError("Camera read failed or camera disconnected.")
@@ -402,7 +423,7 @@ def capture_worker(
                 report(
                     events, "dimensions", width=frame.shape[1], height=frame.shape[0]
                 )
-            elif not encoded and frame.shape != first_size:
+            elif frame.shape != first_size:
                 raise RuntimeError("Source dimensions changed during the session.")
             if mode is SourceMode.VIDEO:
                 if not step:
@@ -437,28 +458,27 @@ def capture_worker(
             fid += 1
             stats["acquired"].value = fid
             stats["source_index"].value = index
-            # Publish to tracking BEFORE touching the recording ring.
-            if not mailbox.put(frame, (fid, acquired, media, index, navigation_id)):
-                stats["mailbox_misses"].value += 1
-                # File playback waits for each frame; never silently skip it.
-                if mode is SourceMode.VIDEO:
-                    while not stop.is_set() and not mailbox.put(
-                        frame, (fid, acquired, media, index, navigation_id)
-                    ):
-                        stop.wait(0.0005)
+            track_frame = True
+            frame_recording_generation = 0
             if (ring is not None and not stats["record_fault"].value
                     and (recording is None or recording.is_set())):
                 if "record_acquired" in stats:
                     stats["record_acquired"].value += 1
-                if ring.put(frame, (fid, acquired, media, acquired_monotonic_ns)):
+                if ring.put(recording_image if recording_image is not None else frame, (fid, acquired, media, acquired_monotonic_ns)):
                     stats["enqueued"].value += 1
+                    frame_recording_generation = recording_generation.value if recording_generation is not None else 0
                 else:
-                    stats["record_fault"].value = 1
-                    report(
-                        events,
-                        "record_error",
-                        message="Recording buffer overflow. Recording stopped; tracking continues. Session is incomplete.",
-                    )
+                    stats["recording_dropped"].value += 1
+                    track_frame = False  # Unsaved images must not enter online tracking.
+            frame_meta = (fid, acquired, media, index, navigation_id, frame_recording_generation)
+            if track_frame and not mailbox.put(frame, frame_meta):
+                stats["mailbox_misses"].value += 1
+                # File playback waits for each frame; never silently skip it.
+                if mode is SourceMode.VIDEO:
+                    while not stop.is_set() and not mailbox.put(
+                        frame, frame_meta
+                    ):
+                        stop.wait(0.0005)
             index += 1
             if mode is SourceMode.VIDEO:
                 while not stop.is_set() and tracked_frame.value < fid:
@@ -475,6 +495,8 @@ def capture_worker(
             reader.close()
         if cap is not None:
             cap.release()
+        if native_controls is not None:
+            native_controls.close()
         if recording_capture_done is not None:
             recording_capture_done.value = recording_generation.value
         done.set()
@@ -576,7 +598,7 @@ def tracking_worker(
                     current = cv2.imdecode(current, cv2.IMREAD_COLOR)
                     if current is None:
                         raise RuntimeError("Cannot decode the camera JPEG frame for tracking.")
-                fid, acquired, media, source_index, navigation_id = meta
+                fid, acquired, media, source_index, navigation_id, frame_recording_generation = meta
                 if (
                     media >= 0
                     and last_media >= 0
@@ -639,9 +661,10 @@ def tracking_worker(
                 )
                 data = payload.encode()
                 stats["send_errors"].value += pub.send(data)
-                if samples is not None and (recording is None or recording.is_set()):
+                if samples is not None and (recording is None or (recording.is_set()
+                        and frame_recording_generation == recording_generation.value)):
                     try:
-                        samples.put_nowait(payload)
+                        samples.put_nowait((payload, core.config.image_brightness))
                     except queue.Full:
                         if not stats["log_fault"].value:
                             report(
@@ -668,11 +691,11 @@ def tracking_worker(
                     revision=revision,
                 )
                 payload.update(source_index=source_index, navigation_id=navigation_id)
-                published = preview.put(current, payload, core.pupil_evidence)
+                published = preview.put(core.current_frame, payload, core.pupil_evidence)
                 if config.value.source.mode is SourceMode.VIDEO:
                     while not published and not stop.is_set():
                         stop.wait(0.001)
-                        published = preview.put(current, payload, core.pupil_evidence)
+                        published = preview.put(core.current_frame, payload, core.pupil_evidence)
                 if published:
                     last_preview = now
             if fresh is not None:
@@ -738,6 +761,8 @@ def writer_worker(
     events,
     test_delay=0,
     recording_capture_done=None, recording_generation=0,
+    directory_reserved=False,
+    camera_diagnostics_path=None,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
@@ -751,13 +776,14 @@ def writer_worker(
     first_monotonic = last_monotonic = None
     frame_file = sample_file = None
     try:
-        folder.mkdir(parents=True, exist_ok=False)
+        if not directory_reserved:
+            folder.mkdir(parents=True, exist_ok=False)
         config.save(folder / "config.json")
         frame_file = (folder / "frames.csv").open("w", newline="", encoding="utf-8")
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
         fw, sw = csv.writer(frame_file), csv.writer(sample_file)
         fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns", "acquisition_monotonic_ns"])
-        sw.writerow(TRACKING_COLUMNS)
+        sw.writerow([*TRACKING_COLUMNS, 'image_brightness'])
         report(events, "writer_ready")
         while True:
             for _ in range(256):
@@ -766,7 +792,7 @@ def writer_worker(
                     if sample is None:
                         log_finished = True
                     else:
-                        sw.writerow(tracking_row(sample))
+                        sw.writerow(recorded_tracking_row(sample))
                         sample_count += 1
                 except queue.Empty:
                     break
@@ -791,6 +817,8 @@ def writer_worker(
                 fw.writerow([video_index, fid, acquired, media, acquired_monotonic_ns])
                 video_index += 1
                 stats["written"].value = video_index
+                if "recorded_seconds" in stats:
+                    stats["recorded_seconds"].value = (last_monotonic - first_monotonic) / 1e9
                 if video_index % 60 == 0:
                     frame_file.flush()
                     sample_file.flush()
@@ -804,7 +832,7 @@ def writer_worker(
                     try:
                         sample = samples.get_nowait()
                         if sample is not None:
-                            sw.writerow(tracking_row(sample))
+                            sw.writerow(recorded_tracking_row(sample))
                             sample_count += 1
                     except queue.Empty:
                         break
@@ -846,16 +874,30 @@ def writer_worker(
         for file in (frame_file, sample_file):
             if file is not None:
                 file.close()
+        try:
+            save_recording_rejections(camera_diagnostics_path, folder / "camera_rejections.jsonl", recording_generation)
+        except OSError as exc:
+            error = f"Could not save camera diagnostics: {exc}"
+            stats["record_fault"].value = 2
+            report(events, "record_error", message=error)
         summary = dict(
             session=session,
             acquired=int(stats.get("record_acquired", stats["acquired"]).value),
             written=video_index,
+            camera_rejected=int(stats["record_camera_rejected"].value) if "record_camera_rejected" in stats else 0,
+            camera_diagnostics_source=str(camera_diagnostics_path) if camera_diagnostics_path else None,
+            recording_dropped=int(stats.get("recording_dropped").value)
+                if "recording_dropped" in stats else 0,
+            recording_policy="best_effort_skip_recording_and_tracking_when_full",
             tracking_samples=sample_count,
             complete=(
                 not error
                 and not stats["record_fault"].value
                 and not stats["capture_fault"].value
-                and video_index == stats.get("record_acquired", stats["acquired"]).value
+                and video_index == stats["enqueued"].value
+                and video_index + (stats["recording_dropped"].value
+                                  if "recording_dropped" in stats else 0)
+                    == stats.get("record_acquired", stats["acquired"]).value
             ),
             tracking_log_complete=not bool(stats["log_fault"].value),
             recording_fault=int(stats["record_fault"].value),
@@ -865,7 +907,12 @@ def writer_worker(
             video_codec=writer.codec if writer is not None else None,
             timestamp_resolution="MKV timestamps may be quantized by muxer; CSV preserves nanoseconds",
             recorded_span_ns=(last_monotonic - first_monotonic) if last_monotonic is not None else 0,
-            camera_driver_drops="not observable through this UVC/OpenCV backend",
+            camera_driver_drops="not observable through the host capture backend",
+        )
+        summary["all_frames_saved"] = bool(summary["complete"] and not summary["recording_dropped"] and not summary["camera_rejected"])
+        summary["recording_result"] = (
+            "failed" if not summary["complete"] or not summary["tracking_log_complete"]
+            else "completed_with_skips" if summary["recording_dropped"] or summary["camera_rejected"] else "completed"
         )
         try:
             (folder / "session.json").write_text(

@@ -31,11 +31,11 @@ uv run mx-eye --demo
 ```
 
 On Raspberry Pi OS/Debian, install `v4l-utils` for USB camera discovery and
-exposure/gain controls. Install `ffmpeg` to save a compatible V4L2 MJPEG camera's
-original compressed frames without re-encoding (`sudo apt install v4l-utils
-ffmpeg`). When that path is unavailable, the recording worker saves decoded
-full-resolution frames using the selected codec. Camera Settings shows driver
-modes and exposure controls; ACQ reports the rate actually delivered.
+exposure/gain controls (`sudo apt install v4l-utils`). Original V4L2 JPEG packets
+are saved without re-encoding when available. Windows DirectShow packet capture
+requires the `ffmpeg` executable on PATH. Other camera paths save decoded frames
+with lossless FFV1. Camera Settings shows driver modes and exposure controls;
+CAM reports the usable frame rate actually delivered.
 
 The **Pupil method** selector offers the original threshold detector,
 Starburst-style radial edges, edge/ellipse fitting, and adaptive thresholding.
@@ -119,7 +119,17 @@ corneal-reflection feature coordinates remain in every packet. A runnable exampl
 Use **File** to open a video or save/load configurations and templates. **Settings**
 contains Camera, Network, Recording and View tabs; View controls GUI refresh rate
 and overlay visibility independently of acquisition/tracking. View options can be
-changed while tracking; source/network/recording settings require a stopped session.
+changed while tracking. Settings stays open while you use Start/Stop in the main
+window. Exposure, gain and image brightness apply automatically after a brief
+pause in editing, without saving or closing Settings. Closing does not undo these
+live adjustments. Other settings use Save.
+Camera selection, format, resolution, FPS, network and recording settings require
+a stopped session. Unchecked **Custom gain** applies the camera-reported default;
+the form shows its advertised minimum, maximum and default (no fixed value of 34).
+Image brightness is a software multiplier (0.1–4×, default 1×), applied only to
+tracking and its preview. Original video is unchanged. The exact operation is
+`cv2.convertScaleAbs(frame, alpha=image_brightness)`; each `tracking.csv` row
+stores its multiplier so changes can be reproduced for that source frame.
 
 The source controls show Start/Stop for camera and simulation, or Open video for
 file playback. Switching source stops the current session. **Record** starts and
@@ -144,15 +154,86 @@ including tracking parameters and ROI, is saved when the application closes.
 
 ### Timestamped recording and playback
 
+New recording folders use local date and time, for example
+`recordings/2026-11-02_14-30-15/video.mkv`. If that second already exists,
+the next folder receives `_01`, `_02`, etc.; existing recordings are never
+overwritten or renamed. The GUI reports recording/finalizing/saved/failed state,
+frames written, their acquisition-time span in seconds, and queued frames. This
+duration describes video received by the writer, rather than the time since
+pressing Record; it freezes when no more video is written. The recording root
+is configurable in Settings → Recording. Relative paths resolve from the launch
+directory; runtime settings in `mx_eye_data` are separate from video recordings.
+
+Recording is best effort: if the bounded buffer fills, incoming video frames are
+skipped and counted while recording and tracking continue. The GUI shows the
+recording skip count separately from tracking skips. Saved frames keep their
+original acquisition timestamps, so skipped frames create time gaps rather than
+sped-up playback. `session.json` reports `recording_dropped` and
+`recording_result` (`completed`, `completed_with_skips`, or `failed`). `complete`
+means the recording finalized with all acquired frames accounted for as saved or
+skipped; `all_frames_saved` additionally requires zero skips. Disk, encoder, and
+capture failures still report an incomplete recording.
+
+On the `feature/mxbi-events` branch, the SDK also accepts acknowledged MXBI Flow
+animal/RFID and stimulus events. The tracker shows the latest event below its
+controls. Animal entry/exit can start/stop a recording while acquisition stays
+running. Recordings include `experiment.json` (entry context) and `events.jsonl`;
+an independent event journal lives under `mx_eye_data/events`. Shared run and
+visit IDs link these to the framework's `eye_events` log. Use the matching local
+`feature/mx-eye-events` framework branch; its `docs/mx-eye-events.md` contains the
+PC demo commands and limitations. This does not change calibration selection or
+eye-coordinate output.
+
+On the `feature/validated-mjpeg-capture` branch, raw camera JPEG buffers with
+missing markers or payload decoding failures are rejected for both tracking and recording, while
+acquisition continues. The GUI reports camera rejections separately from tracking
+and recording skips. No replacement sample is emitted; real acquisition timestamps
+preserve the gap. Two seconds without a decoder-accepted JPEG, checked after each
+returned raw buffer, stops acquisition. A blocked camera read is not interrupted
+by this check, and camera read/disconnection errors still stop acquisition.
+
+Every rejection is saved with wall-clock/monotonic timestamps, reason, byte count,
+buffer shape/type, and first/last bytes in
+`mx_eye_data/camera_diagnostics/<acquisition-session>.jsonl`. On recording
+finalization, that recording's entries are copied to `camera_rejections.jsonl`
+beside the video; `session.json` includes its `camera_rejected` total and source
+diagnostic path. GUI `camera_rejected` is acquisition-wide;
+`record_camera_rejected` resets per recording. A finalized recording with camera
+rejections is `completed_with_skips` and `all_frames_saved` is false. Validation
+uses FFmpeg's MJPEG decoder with `err_detect=explode`; decoder acceptance is not
+a guarantee that every conceivable camera corruption can be detected.
+
 Recordings use `video.mkv` with per-frame presentation timestamps derived from
 monotonic host acquisition time. Accessible camera MJPEG packets are copied without
-re-encoding; decoded BGR frames use lossless FFV1. The Windows OpenCV camera path
-normally provides decoded frames and therefore uses FFV1, even for a camera set to
-MJPG. Codec selection is automatic. Legacy codec settings remain loadable but no
+re-encoding; decoded BGR frames use lossless FFV1. Windows DirectShow MJPG/JPEG
+capture uses the `ffmpeg` executable on PATH to copy original packets through a
+framed NUT pipe; Linux V4L2 uses OpenCV's raw JPEG output. Both paths decode each
+packet once before saving its original bytes and publishing decoded pixels to
+tracking. Color webcams retain color; monochrome JPEGs remain monochrome.
+
+Windows exposure/gain uses native DirectShow controls with explicit auto/manual
+flags, independently of packet capture. Linux uses advertised V4L2 controls.
+Unsupported controls and driver errors are reported rather than treated as success.
+MSMF, non-JPEG modes, and cameras returning decoded images use the
+explicit FFV1 fallback. Missing FFmpeg fails with an installation/fallback message.
+FFmpeg's camera process is cancelled on Stop, including blocked pipe reads.
+Host timestamps are taken when packets reach Python, including transport delay;
+they are not exposure timestamps. No settings files are rewritten by this change.
+
+During recording, frames are offered to the recording FIFO before tracking.
+If the FIFO is full, that frame is skipped for both consumers. Tracking rows
+are tagged internally with the recording generation so a pre-recording preview
+cannot be logged as part of a new recording. Tracking may process fewer frames
+than are saved; join `tracking.csv` and `frames.csv` on `source_frame` to select
+the same offline frames. This guarantee applies to successful recordings; a
+later disk failure still invalidates completeness. Exact result reproduction
+also requires the same tracker settings/state, beyond matching frame identity.
+
+Codec selection is automatic. Legacy codec settings remain loadable but no
 longer control recording. PyAV supplies the video reader/writer through the GUI extra.
 
 `frames.csv` keeps its existing columns and adds `acquisition_monotonic_ns`;
-`tracking.csv` retains its 17-column schema. Wall-clock timestamps still support
+`tracking.csv` adds `image_brightness` after its original 17 columns. Wall-clock timestamps still support
 cross-device synchronization; monotonic timestamps drive video intervals. Neither
 is a sensor exposure timestamp. MKV timestamp precision depends on the muxer
 (typically milliseconds); the CSV retains nanosecond values. The final frame's

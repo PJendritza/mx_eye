@@ -108,8 +108,18 @@ def discover():
             error = str(exc)
         finally:
             graph.remove_filters()
+        controls = {}
+        try:
+            from .windows_camera_controls import WindowsCameraControls
+            native = WindowsCameraControls(index)
+            try:
+                controls = native.describe()
+            finally:
+                native.close()
+        except Exception as exc:
+            error = '; '.join(filter(None, (error, f'Control discovery: {exc}')))
         cameras.append(dict(index=index, name=name, device='', backend='dshow',
-                            formats=formats, controls={}, error=error))
+                            formats=formats, controls=controls, error=error))
     return cameras
 
 
@@ -131,16 +141,16 @@ def camera_target(source):
     return int(source['camera'])
 
 
-def apply_controls(cap, source):
+def apply_controls(cap, source, native=None):
     """Explicit requests and readbacks; never claim a successful set proves exposure."""
     exposure = source.get('exposure_mode', 'unchanged')
     gain = source.get('gain')
     replies = []
     if backend_for(source) == cv2.CAP_V4L2:
-        if exposure == 'unchanged' and gain is None:
-            return 'Camera exposure/gain unchanged.'
         device = camera_target(source)
         controls = parse_controls(v4l2(device, '--list-ctrls-menus'))
+        if gain is None:
+            gain = controls.get('gain', {}).get('default')
         # Names changed in v4l-utils; select names actually returned by the driver.
         auto = next((n for n in ('auto_exposure', 'exposure_auto') if n in controls), None)
         absolute = next((n for n in ('exposure_time_absolute', 'exposure_absolute') if n in controls), None)
@@ -183,6 +193,22 @@ def apply_controls(cap, source):
                 replies.append(v4l2(device, f'--get-ctrl={name}').strip())
             except RuntimeError as exc:
                 replies.append(f'{name}: {exc}')
+    elif sys.platform == 'win32':
+        from .windows_camera_controls import WindowsCameraControls
+        owned = native is None
+        native = native or WindowsCameraControls(int(source['camera']))
+        try:
+            limits = native.describe()
+            if exposure != 'unchanged':
+                raw = round(math.log2(source['exposure_ms'] / 1000))
+                replies.append(native.set('exposure', raw, auto=exposure == 'auto'))
+            if gain is None:
+                gain = limits.get('gain', {}).get('default')
+            if gain is not None:
+                replies.append(native.set('gain', gain))
+        finally:
+            if owned:
+                native.close()
     else:
         if exposure != 'unchanged':
             ok = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, .25 if exposure == 'manual' else .75)

@@ -38,6 +38,7 @@ class Settings(W.QDialog):
         super().__init__(parent)
         self.config = cfg.MxEyeConfigStore(config.value.model_copy(deep=True))
         self.fields = {}
+        self.pages = {}
         self.setWindowTitle("mx_eye · Settings")
         self.resize(500, 530)
         layout = W.QVBoxLayout(self)
@@ -75,7 +76,7 @@ class Settings(W.QDialog):
         notes = {
             "Camera": "FPS and format are requests to the driver. The status bar shows measured acquisition rate. Recording is controlled separately by the Record button.",
             "Network": "For another computer, bind to 0.0.0.0 and use this tracker’s IP in the SDK. Samples use ZeroMQ PUB/SUB; commands use REQ/REP. Control is unauthenticated: use only your trusted local network.",
-            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, recording stops and is marked incomplete; tracking continues.",
+            "Recording": "Timestamped MKV: original MJPEG packets are copied when accessible; decoded frames use lossless FFV1. No overlays are recorded. If the buffer fills, incoming frames are skipped and counted; recording and tracking continue. Acquisition timestamps preserve the gaps.",
             "View": "Display refresh is independent of acquisition and tracking. Suspend displays to remove preview and plot work while tracking continues.",
         }
         for title, (group, rows) in specs.items():
@@ -84,7 +85,14 @@ class Settings(W.QDialog):
             form.setVerticalSpacing(13)
             if title == "Camera":
                 self.camera_controls = CameraControls(config.value.source, self, getattr(parent, "camera_discovery", None))
+                self.camera_controls.brightness.setValue(config.value.tracking.image_brightness)
                 form.addRow(self.camera_controls)
+                hint = label('Exposure, gain and image brightness apply automatically. Use Start/Stop in the main window.', 'muted')
+                hint.setWordWrap(True)
+                form.addRow(hint)
+                self.camera_reply = W.QLabel()
+                self.camera_reply.setWordWrap(True)
+                form.addRow(self.camera_reply)
             for key, text, *args in rows:
                 value = getattr(getattr(config.value, group), key)
                 if args[0] is True:
@@ -115,22 +123,66 @@ class Settings(W.QDialog):
             note.setWordWrap(True)
             form.addRow(note)
             tabs.addTab(page, title)
-            if parent is not None and parent.service.run and title != "View":
-                page.setEnabled(False)
-        if parent is not None and parent.service.run:
-            tabs.setCurrentIndex(tabs.count() - 1)
+            self.pages[title] = page
         buttons = W.QDialogButtonBox(
-            W.QDialogButtonBox.Save | W.QDialogButtonBox.Cancel
+            W.QDialogButtonBox.Save | W.QDialogButtonBox.Close
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        for button in buttons.buttons():
+            button.setAutoDefault(False)
+            button.setDefault(False)
         layout.addWidget(buttons)
+        self.auto_apply = C.QTimer(self)
+        self.auto_apply.setSingleShot(True)
+        self.auto_apply.setInterval(200)
+        self.auto_apply.timeout.connect(self.apply_camera)
+        for widget, signal in ((self.camera_controls.exposure_mode, 'currentIndexChanged'),
+                               (self.camera_controls.exposure, 'valueChanged'),
+                               (self.camera_controls.gain_on, 'toggled'),
+                               (self.camera_controls.gain, 'valueChanged'),
+                               (self.camera_controls.brightness, 'valueChanged')):
+            getattr(widget, signal).connect(lambda *_: self.auto_apply.start())
+        self.reply_timer = C.QTimer(self)
+        self.reply_timer.timeout.connect(self.update_running_state)
+        self.reply_timer.start(150)
+        self.update_running_state()
         add_tooltips(self)
 
     def choose_folder(self):
         path = W.QFileDialog.getExistingDirectory(self, "Recording folder")
         if path:
             self.fields["recording", "directory"].setText(path)
+
+    def apply_camera(self):
+        self.auto_apply.stop()
+        if self.parent() is None:
+            return
+        if self.parent().service.config.value.source.mode is SourceMode.CAMERA:
+            self.parent().call('camera_controls', controls=self.camera_controls.live_values(),
+                               image_brightness=self.camera_controls.brightness.value())
+        else:
+            tracking = self.parent().service.config.value.tracking.model_copy(deep=True)
+            tracking.image_brightness = self.camera_controls.brightness.value()
+            self.parent().call('config', tracking=tracking)
+
+    def update_running_state(self):
+        if self.parent() is None:
+            return
+        service = self.parent().service
+        running = bool(service.run)
+        self.camera_controls.set_running(running)
+        for title in ('Network', 'Recording'):
+            self.pages[title].setEnabled(not running)
+        self.camera_reply.setText(service.camera_control_info)
+
+    def prepare_start(self):
+        """Include current camera edits even if their debounce has not fired yet."""
+        self.auto_apply.stop()
+        service = self.parent().service
+        service.config.value.source = self.camera_controls.values()
+        service.config.value.tracking.image_brightness = self.camera_controls.brightness.value()
+        self.parent().camera.setValue(service.config.value.source.camera)
 
     def accept(self):
         if self.camera_controls.process is not None:
@@ -141,8 +193,15 @@ class Settings(W.QDialog):
             )
             return
         try:
+            if self.parent() is not None:
+                # Other main-window parameters may have changed while this
+                # non-modal window was open. Preserve those current values.
+                self.config = cfg.MxEyeConfigStore(self.parent().service.config.value.model_copy(deep=True))
             if self.parent() is None or not self.parent().service.run:
                 self.config.value.source = self.camera_controls.values()
+            else:
+                self.apply_camera()
+            self.config.value.tracking.image_brightness = self.camera_controls.brightness.value()
             for (group, key), widget in self.fields.items():
                 if self.parent() is not None and self.parent().service.run and group != "display":
                     continue
@@ -164,6 +223,9 @@ class Settings(W.QDialog):
         super().accept()
 
     def done(self, result):
+        if self.auto_apply.isActive():
+            self.apply_camera()
+        self.reply_timer.stop()
         self.camera_controls.stop_scan()
         super().done(result)
 
@@ -195,6 +257,8 @@ class Window(W.QMainWindow):
         self.last_session = None
         self.rate_last = (time.monotonic(), 0, 0)
         self.rates = (0, 0)
+        self.recording_rate_last = None
+        self.recording_rate = 0
         self._closing = False
         self.calibration_window = None
         self.saved_source_path = config.value.source.path
@@ -290,16 +354,19 @@ class Window(W.QMainWindow):
         metrics_row = W.QHBoxLayout(metrics_bar)
         metrics_row.setContentsMargins(13, 8, 13, 8)
         metrics_row.setSpacing(12)
-        self.metrics = label("ACQ —  TRACK —  PROC —  SKIPPED —  VIDEO —", "muted")
+        self.metrics = label("CAM —  TRACK —  REC —  Tracking skipped —", "muted")
         self.metrics.setFont(G.QFontDatabase.systemFont(G.QFontDatabase.FixedFont))
         self.metrics.setFixedWidth(self.metrics.fontMetrics().horizontalAdvance(
-            "ACQ 999.9 fps  TRACK 999.9 fps  PROC 999.99 ms  SKIPPED 999999  VIDEO 999999 frames · buffer 9999"
+            "SOURCE 999.9 fps  TRACK 999.9 fps  REC 999.9 fps  Tracking skipped 999999  Camera rejected 999999"
         ))
         self.metrics.setToolTip("Acquisition, tracking and recording status")
         metrics_row.addWidget(self.metrics)
         self.reason_label = label("", "metricAlert")
         metrics_row.addStretch()
         layout.addWidget(metrics_bar)
+        self.recording_status = label("Not recording", "muted")
+        self.recording_status.setWordWrap(True)
+        layout.addWidget(self.recording_status)
         split = W.QSplitter(C.Qt.Horizontal)
         layout.addWidget(split, 1)
         main = W.QWidget()
@@ -595,6 +662,9 @@ class Window(W.QMainWindow):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(C.Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
+        self.experiment_status = label("MXBI: no experiment events received", "muted")
+        self.experiment_status.setWordWrap(True)
+        layout.addWidget(self.experiment_status)
         self.param_timer = C.QTimer(self)
         self.param_timer.setSingleShot(True)
         self.param_timer.timeout.connect(self.send_parameters)
@@ -729,6 +799,12 @@ class Window(W.QMainWindow):
                 self.call("stop")
 
     def start(self):
+        settings = getattr(self, 'settings_dialog', None)
+        if settings is not None and settings.isVisible():
+            if settings.camera_controls.process is not None:
+                W.QMessageBox.information(self, 'Camera modes', 'Wait for camera discovery to finish before starting.')
+                return
+            settings.prepare_start()
         if self.source_mode() is SourceMode.CAMERA:
             self.ensure_camera_modes()
             if self.camera_discovery.process is not None:
@@ -836,14 +912,26 @@ class Window(W.QMainWindow):
             self.call("display", suspended=display.suspended, hz=display.hz)
 
     def settings(self):
+        existing = getattr(self, 'settings_dialog', None)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
         config = cfg.MxEyeConfigStore(self.service.config.value.model_copy(deep=True))
         config.value.source.camera = self.camera.value()
         dialog = Settings(config, self)
-        if dialog.exec() == W.QDialog.Accepted:
-            if not self.service.run:
-                self.camera.setValue(dialog.config.value.source.camera)
-                self.call("settings", config=dialog.config)
-            self.apply_view_settings(dialog.config.value.display)
+        self.settings_dialog = dialog
+        def finished(result):
+            if result == W.QDialog.Accepted:
+                if not self.service.run:
+                    self.camera.setValue(dialog.config.value.source.camera)
+                    self.call("settings", config=dialog.config)
+                self.apply_view_settings(dialog.config.value.display)
+            self.settings_dialog = None
+            dialog.deleteLater()
+        dialog.finished.connect(finished)
+        dialog.show()
 
     def pause_changed(self, paused):
         self.pause.setText("Play" if paused else "Pause")
@@ -1135,6 +1223,15 @@ class Window(W.QMainWindow):
                     )
         state = self.service.snapshot()
         mode = self.source_mode()
+        experiment = state.experiment_event
+        if experiment is not None:
+            absent = experiment.kind in ("animal_left", "run_ended", "detector_fault")
+            animal = "No animal" if absent else experiment.animal or "Unknown animal"
+            self.experiment_status.setText(
+                f"MXBI: {animal} · RFID {experiment.rfid_id or 'unknown'} · "
+                f"{experiment.kind} · {experiment.stimulus_id or ''}"
+            )
+            self.experiment_status.setToolTip(state.event_log)
         if self.pending_video_path and not self.service.run and not self.pending:
             if (
                 mode is SourceMode.VIDEO
@@ -1168,7 +1265,7 @@ class Window(W.QMainWindow):
             self.requested_fps.setText(f"{source.fps:g} fps requested" if ready else "")
             self.requested_fps.setToolTip(
                 "Request validated against cached advertised modes when available. "
-                "ACQ shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
+                "CAM shows measured frame delivery; OpenCV FPS readback is not a verified camera rate.")
         else:
             self.requested_fps.setText(f"{source.fps:g} fps")
             self.requested_fps.setToolTip("")
@@ -1188,11 +1285,37 @@ class Window(W.QMainWindow):
         self.open_button.setEnabled(not self.pending and not self._closing)
         run = self.service.run
         recording = bool(run and run["recording"].is_set())
+        local_stats = ({key: value.value for key, value in run["stats"].items()}
+                       if run else self.service.last_stats)
+        camera_rejected = int(local_stats.get("camera_rejected", 0))
+        record_camera_rejected = int(local_stats.get("record_camera_rejected", 0))
         draining = bool(run and not recording and not run["writer_done"].is_set())
         self.record_button.setToolTip(self.service.recording_path_info or "Automatic MKV recording: MJPEG copy or lossless FFV1")
         self.record_button.setText("■ Stop recording" if recording else "Finalizing…" if draining else "● Record")
         self.record_button.setEnabled(state.state == "running" and mode is not SourceMode.VIDEO
                                       and not draining and not self.pending and not state.stats.record_fault)
+        if state.stats.record_fault:
+            recording_label = "FAILED — INCOMPLETE"
+        elif recording:
+            recording_label = "● RECORDING"
+        elif draining:
+            recording_label = "FINALIZING"
+        elif state.directory:
+            recording_label = "STOPPED" if state.stats.log_fault or state.stats.capture_fault else "SAVED"
+            if recording_label == "SAVED" and (state.stats.recording_dropped or record_camera_rejected):
+                recording_label = "SAVED WITH SKIPS"
+        else:
+            recording_label = "NOT RECORDING"
+        backlog_count = max(0, int(state.stats.enqueued - state.stats.written))
+        self.recording_status.setText(
+            f"{recording_label} · {int(state.stats.written):,} frames written · "
+            f"{state.stats.recorded_seconds:.1f} s video · "
+            f"{state.stats.recording_dropped:,} recording frames skipped · {backlog_count} frames queued"
+            f" · {record_camera_rejected:,} camera frames rejected in recording"
+            + (f" · {Path(state.directory).name}/video.mkv" if state.directory else "")
+        )
+        self.recording_status.setToolTip(state.directory or str(
+            Path(self.service.config.value.recording.directory).expanduser().resolve()))
         video = active and self.service.config.value.source.mode is SourceMode.VIDEO
         if not video:
             self.navigation_pending = None
@@ -1228,6 +1351,8 @@ class Window(W.QMainWindow):
             self.last_history_frame = None
             self.last_session = state.session
             self.rate_last = (time.monotonic(), 0, 0)
+            self.rates = (0, 0)
+            self.recording_rate_last = None
         now = time.monotonic()
         last, a, t = self.rate_last
         if now - last >= 0.5:
@@ -1236,18 +1361,19 @@ class Window(W.QMainWindow):
                 (stats.tracked - t) / (now - last),
             )
             self.rate_last = (now, stats.acquired, stats.tracked)
-        backlog = int(stats.enqueued - stats.written)
-        recording = (
-            "FAULT — INCOMPLETE"
-            if stats.record_fault
-            else (
-                f"{int(stats.written)} frames · buffer {backlog}"
-                if state.directory
-                else "off"
-            )
-        )
-        if stats.log_fault:
-            recording += " · LOG INCOMPLETE"
+        if recording or draining:
+            previous = self.recording_rate_last
+            if previous is None or previous[2] != state.directory or stats.written < previous[1]:
+                self.recording_rate_last = (now, stats.written, state.directory)
+                self.recording_rate = 0
+            elif now - previous[0] >= 0.5:
+                self.recording_rate = (stats.written - previous[1]) / (now - previous[0])
+                self.recording_rate_last = (now, stats.written, state.directory)
+            recording_rate_text = f"{self.recording_rate:5.1f} fps"
+        else:
+            self.recording_rate_last = None
+            self.recording_rate = 0
+            recording_rate_text = "off"
         fault = bool(stats.capture_fault or stats.tracking_fault or stats.record_fault or stats.log_fault)
         if fault:
             self._error_text = state.message or "Acquisition, tracking, or recording error"
@@ -1255,11 +1381,15 @@ class Window(W.QMainWindow):
         elif self._error_until == float("inf"):
             self._error_until = now + 0.25
         metrics_text = (
-            f"ACQ {self.rates[0]:5.1f} fps  TRACK {self.rates[1]:5.1f} fps  "
-            f"PROC {stats.processing_us / 1000:6.2f} ms  "
-            f"SKIPPED {int(stats.tracking_skips):6d}  VIDEO {recording}"
+            f"{'CAM' if mode is SourceMode.CAMERA else 'SOURCE'} {self.rates[0]:5.1f} fps  "
+            f"TRACK {self.rates[1]:5.1f} fps  REC {recording_rate_text}  "
+            f"Tracking skipped {int(stats.tracking_skips):6d}  Camera rejected {camera_rejected}"
         )
-        self.metrics.setToolTip(metrics_text)
+        self.metrics.setToolTip(
+            metrics_text + "\nCAM/SOURCE: frames received; TRACK: frames processed; "
+            "REC: frames written per elapsed second (also while finalizing). "
+            "Rates update every half second. Recording skips and totals are shown below."
+        )
         self.metrics.setText(self.metrics.fontMetrics().elidedText(
             metrics_text, C.Qt.ElideRight, self.metrics.width() - 2
         ))
@@ -1403,6 +1533,9 @@ class Window(W.QMainWindow):
             C.QTimer.singleShot(100, self.close)
             return
         self.camera_discovery.stop()
+        settings = getattr(self, 'settings_dialog', None)
+        if settings is not None:
+            settings.close()
         try:
             self._config_snapshot().save_persistent()
         except (ValueError, OSError):

@@ -74,6 +74,7 @@ class CameraControls(W.QWidget):
         self.source=source.model_dump(mode="json")
         source=self.source
         self.cameras=[]
+        self.running = False
         self.owns_discovery = discovery is None
         self.discovery = discovery or CameraModeDiscovery(self)
         self.discovery.finished.connect(self.load_modes)
@@ -126,23 +127,40 @@ class CameraControls(W.QWidget):
         self.exposure.setValue(source.get('exposure_ms',7.8125))
         self.exposure.setEnabled(self.exposure_mode.currentData()=='manual')
         self.exposure_mode.currentIndexChanged.connect(lambda: self.exposure.setEnabled(self.exposure_mode.currentData()=='manual'))
-        self.exposure.setToolTip('Requested duration. Windows uses discrete log2(seconds) steps; Linux uses the camera’s V4L2 range and steps. Readbacks appear after Start.')
-        self.exposure_mode.setToolTip('Keep the camera’s current exposure behavior, request automatic exposure, or set a fixed exposure duration when the session starts.')
-        self.gain_on=W.QCheckBox('Set manual gain')
+        self.exposure.setToolTip('Requested duration. Windows uses discrete log2(seconds) steps; Linux uses the camera’s V4L2 range and steps. Apply live or save for the next Start.')
+        self.exposure_mode.setToolTip('Keep the current exposure behavior, request automatic exposure, or set a fixed exposure duration. Use Apply while running.')
+        self.gain_on=W.QCheckBox('Custom gain (unchecked: camera default)')
         self.gain_on.setChecked(source.get('gain') is not None)
         self.gain=W.QSpinBox()
         self.gain.setRange(0,65535)
         self.gain.setValue(source.get('gain') or 0)
         self.gain.setEnabled(self.gain_on.isChecked())
         self.gain_on.toggled.connect(self.gain.setEnabled)
-        self.gain_on.setToolTip('Request manual gain at Start. Uncheck to leave gain unchanged in the driver.')
-        self.gain.setToolTip('Raw driver gain units. Linux uses the advertised range. Unsupported requests are reported after Start.')
+        self.gain_default = None
+        self.gain_on.toggled.connect(lambda custom: self.gain.setValue(self.gain_default)
+                                    if not custom and self.gain_default is not None else None)
+        self.gain_on.setToolTip('Check to choose a gain. Uncheck to apply the camera-reported default.')
+        self.gain.setToolTip('Raw driver units. Uncheck Custom gain to apply the camera-reported default.')
         form.addRow('Exposure mode',self.exposure_mode)
         form.addRow('Exposure duration',self.exposure)
+        self.exposure_info = W.QLabel('Exposure limits/default unavailable until camera discovery.')
+        self.exposure_info.setStyleSheet('font-size: 11px; color: #888;')
+        form.addRow(self.exposure_info)
         gain_row=W.QHBoxLayout()
         gain_row.addWidget(self.gain_on)
         gain_row.addWidget(self.gain)
         form.addRow('Gain',gain_row)
+        self.gain_info = W.QLabel('Gain limits/default unavailable until camera discovery.')
+        self.gain_info.setStyleSheet('font-size: 11px; color: #888;')
+        form.addRow(self.gain_info)
+        self.brightness = W.QDoubleSpinBox()
+        self.brightness.setRange(.1, 4)
+        self.brightness.setSingleStep(.1)
+        self.brightness.setDecimals(2)
+        self.brightness.setValue(1)
+        self.brightness.setSuffix(' ×')
+        self.brightness.setToolTip('Software multiplier for tracking and preview only. 1 = unchanged. Original video is saved; tracking.csv records the multiplier per sample.')
+        form.addRow('Image brightness', self.brightness)
 
         self.camera.currentIndexChanged.connect(self.camera_changed)
         self.resolution.currentIndexChanged.connect(self.resolution_changed)
@@ -158,6 +176,15 @@ class CameraControls(W.QWidget):
     @property
     def process(self):
         return self.discovery.process
+
+    def set_running(self, running):
+        self.running = running
+        for widget in (self.camera, self.resolution, self.format, self.fps, self.manual, self.refresh):
+            widget.setEnabled(not running)
+
+    def live_values(self):
+        return dict(exposure_mode=self.exposure_mode.currentData(), exposure_ms=self.exposure.value(),
+                    gain=self.gain.value() if self.gain_on.isChecked() else None)
 
     def scan(self):
         self.info.setText('Scanning connected cameras…')
@@ -194,18 +221,33 @@ class CameraControls(W.QWidget):
         with C.QSignalBlocker(self.camera):
             self.camera.setCurrentIndex(max(0, self.camera.findData(validated.camera)))
         self.camera_changed(preferred=(validated.width, validated.height))
+        self.set_running(self.running)
 
     def camera_changed(self,*args,preferred=None):
         camera=next((item for item in self.cameras if item['index']==self.camera.currentData()),None)
         if camera is None: return
         self.index.setValue(camera['index'])
         gain_limits=camera.get('controls',{}).get('gain',{})
+        self.gain_default = gain_limits.get('default')
         self.gain.setRange(gain_limits.get('min',0),gain_limits.get('max',65535))
         self.gain.setSingleStep(max(1,gain_limits.get('step',1)))
+        if 'default' in gain_limits:
+            self.gain_info.setText(f"Min {gain_limits['min']} · max {gain_limits['max']} · default {gain_limits['default']}")
+            if self.source.get('gain') is None:
+                self.gain.setValue(gain_limits['default'])
+        else:
+            self.gain_info.setText('Gain limits/default not advertised by this camera.')
         controls=camera.get('controls',{})
         exposure_limits=next((controls[n] for n in ('exposure_time_absolute','exposure_absolute') if n in controls),{})
-        self.exposure.setRange(max(.01,exposure_limits.get('min',1)/10),min(1000,exposure_limits.get('max',10000)/10))
-        self.exposure.setSingleStep(max(.01,exposure_limits.get('step',10)/10))
+        if 'exposure' in controls:  # DirectShow log2(seconds).
+            limits = controls['exposure']
+            self.exposure.setRange(max(.01, 1000 * 2.0 ** limits['min']), min(1000, 1000 * 2.0 ** limits['max']))
+            self.exposure_info.setText(f"Min {1000 * 2.0 ** limits['min']:g} · max {1000 * 2.0 ** limits['max']:g} · default {1000 * 2.0 ** limits['default']:g} ms (discrete steps)")
+        else:
+            self.exposure.setRange(max(.01,exposure_limits.get('min',1)/10),min(1000,exposure_limits.get('max',10000)/10))
+            self.exposure.setSingleStep(max(.01,exposure_limits.get('step',10)/10))
+            self.exposure_info.setText((f"Min {exposure_limits['min']/10:g} · max {exposure_limits['max']/10:g} · default {exposure_limits['default']/10:g} ms")
+                                      if 'default' in exposure_limits else 'Exposure limits/default not advertised.')
         self.backend.setCurrentText(self.source['backend'] if preferred is not None else camera.get('backend', 'auto'))
         usable=[m for m in camera['formats'] if len(m['fourcc'])==4]
         modes=usable or camera['formats']

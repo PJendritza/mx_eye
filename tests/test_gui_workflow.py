@@ -46,6 +46,11 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
             directory = Path(service.directory)
             directories.append(directory)
             wait_until(lambda: service.snapshot().stats.written >= 5)
+            tracking = service.config.value.tracking.model_copy(deep=True)
+            tracking.image_brightness = 1.75
+            service.submit('config', tracking=tracking).result(timeout=3)
+            before = service.snapshot().stats.tracked
+            wait_until(lambda: service.snapshot().stats.tracked >= before + 3)
             service.submit("record", enabled=False).result(timeout=3)
             wait_until(lambda: service.run["writer_done"].is_set()
                        and not service.run["processes"]["writer"].is_alive())
@@ -54,9 +59,11 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
             wait_until(lambda: service.snapshot().stats.tracked > before + 2)
             with (directory / "tracking.csv").open(newline="") as stream:
                 rows = list(csv.reader(stream))
-            assert len(rows[0]) == 17
+            assert len(rows[0]) == 18
+            assert rows[0][-1] == 'image_brightness'
             assert len(rows) > 1
-            assert all(len(row) == 17 for row in rows)
+            assert all(len(row) == 18 for row in rows)
+            assert any(float(row[-1]) == 1.75 for row in rows[1:])
             summary = json.loads((directory / "session.json").read_text())
             assert summary["complete"], summary
             assert summary["acquired"] == summary["written"] >= 5
@@ -72,6 +79,72 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
         service.submit("stop").result(timeout=3)
         wait_until(lambda: service.run is None)
         assert service.snapshot().state == "idle", service.snapshot()
+    finally:
+        service.close()
+
+
+def test_recording_overload_skips_frames_and_preserves_timing(monkeypatch, tmp_path):
+    import av
+    from mx_eye.pipeline import writer_worker
+
+    monkeypatch.setenv("MX_EYE_DATA_DIR", str(tmp_path / "runtime"))
+    config = cfg.MxEyeConfigStore.defaults()
+    config.value.source.mode = cfg.SourceMode.SIMULATION
+    config.value.source.fps = 120
+    config.value.recording.directory = str(tmp_path / "recordings")
+    config.value.recording.buffer_mb = 8
+    config.value.network.control_port = free_port()
+    config.value.network.data_port = free_port()
+    service = Service(config)
+    original_process = service.ctx.Process
+
+    def slow_writer(*args, **kwargs):
+        if kwargs.get("target") is writer_worker:
+            kwargs["kwargs"]["test_delay"] = 0.08
+        return original_process(*args, **kwargs)
+
+    monkeypatch.setattr(service.ctx, "Process", slow_writer)
+    try:
+        service.submit("start").result(timeout=15)
+        service.submit("record", enabled=True).result(timeout=15)
+        directory = Path(service.directory)
+        wait_until(lambda: service.snapshot().stats.written >= 6
+                   and service.snapshot().stats.recording_dropped > 0)
+        assert service.snapshot().recording
+        assert not service.run["stats"]["record_fault"].value
+        before = service.snapshot().stats.tracked
+        wait_until(lambda: service.snapshot().stats.tracked > before + 2)
+        service.submit("record", enabled=False).result(timeout=3)
+        wait_until(lambda: service.run["writer_done"].is_set()
+                   and not service.run["processes"]["writer"].is_alive())
+        summary = json.loads((directory / "session.json").read_text())
+        assert summary["complete"], summary
+        assert not summary["all_frames_saved"]
+        assert summary["recording_result"] == "completed_with_skips"
+        assert summary["acquired"] == summary["written"] + summary["recording_dropped"]
+        assert summary["written"] == service.snapshot().stats.enqueued
+        with (directory / "frames.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        ids = [int(row["source_frame"]) for row in rows]
+        with (directory / "tracking.csv").open(newline="") as stream:
+            tracking_rows = list(csv.DictReader(stream))
+        assert tracking_rows
+        assert {int(row["source_frame"]) for row in tracking_rows} <= set(ids)
+        assert any(b - a > 1 for a, b in zip(ids, ids[1:]))
+        times = [int(row["acquisition_monotonic_ns"]) for row in rows]
+        assert all(b > a for a, b in zip(times, times[1:]))
+        with av.open(str(directory / "video.mkv")) as video:
+            pts = [float(frame.pts * frame.time_base) for frame in video.decode(video=0)]
+        assert len(pts) == len(rows)
+        assert all(abs((point - pts[0]) - (stamp - times[0]) / 1e9) < 0.002
+                   for point, stamp in zip(pts, times))
+        # Overload must not latch a fault that prevents the next recording.
+        service.submit("record", enabled=True).result(timeout=15)
+        assert service.snapshot().recording
+        assert Path(service.directory) != directory
+        service.submit("record", enabled=False).result(timeout=3)
+        wait_until(lambda: service.run["writer_done"].is_set()
+                   and not service.run["processes"]["writer"].is_alive())
     finally:
         service.close()
 
@@ -142,10 +215,22 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch, tmp_path):
         app.processEvents()
         assert (window.eye.geometry(), window.full.geometry(), window.size()) == geometry
         window.service.source_info.update(mode=cfg.SourceMode.CAMERA, driver_fps=30)
+        window.source.setCurrentIndex(window.source.findData(cfg.SourceMode.CAMERA.value))
         window.refresh()
+        assert "NOT RECORDING" in window.recording_status.text()
+        assert "0 frames written" in window.recording_status.text()
+        assert "0.0 s video" in window.recording_status.text()
         assert window.requested_fps.text() == "30 fps requested"
         assert config.value.source.fps == 30
         assert len(scans) == 1
+        window.settings()
+        opened_settings = window.settings_dialog
+        assert opened_settings.isVisible()
+        assert not opened_settings.isModal()
+        window.settings()
+        assert window.settings_dialog is opened_settings
+        opened_settings.close()
+        assert window.settings_dialog is None
         config.value.source = SourceConfig(**dict(config.value.source.model_dump(), fps=15))
         dialog = Settings(config, window)
         assert dialog.camera_controls.discovery is window.camera_discovery

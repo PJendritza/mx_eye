@@ -119,7 +119,17 @@ corneal-reflection feature coordinates remain in every packet. A runnable exampl
 Use **File** to open a video or save/load configurations and templates. **Settings**
 contains Camera, Network, Recording and View tabs; View controls GUI refresh rate
 and overlay visibility independently of acquisition/tracking. View options can be
-changed while tracking; source/network/recording settings require a stopped session.
+changed while tracking. Settings stays open while you use Start/Stop in the main
+window. Exposure, gain and image brightness apply automatically after a brief
+pause in editing, without saving or closing Settings. Closing does not undo these
+live adjustments. Other settings use Save.
+Camera selection, format, resolution, FPS, network and recording settings require
+a stopped session. Unchecked **Custom gain** applies the camera-reported default;
+the form shows its advertised minimum, maximum and default (no fixed value of 34).
+Image brightness is a software multiplier (0.1–4×, default 1×), applied only to
+tracking and its preview. Original video is unchanged. The exact operation is
+`cv2.convertScaleAbs(frame, alpha=image_brightness)`; each `tracking.csv` row
+stores its multiplier so changes can be reproduced for that source frame.
 
 The source controls show Start/Stop for camera and simulation, or Open video for
 file playback. Switching source stops the current session. **Record** starts and
@@ -201,9 +211,10 @@ framed NUT pipe; Linux V4L2 uses OpenCV's raw JPEG output. Both paths decode eac
 packet once before saving its original bytes and publishing decoded pixels to
 tracking. Color webcams retain color; monochrome JPEGs remain monochrome.
 
-Windows packet capture requires exposure mode `unchanged` and no explicit gain.
-Manual exposure/gain requests retain the OpenCV/FFV1 path and show a fallback
-notice. MSMF, non-JPEG modes, and cameras returning decoded images also use the
+Windows exposure/gain uses native DirectShow controls with explicit auto/manual
+flags, independently of packet capture. Linux uses advertised V4L2 controls.
+Unsupported controls and driver errors are reported rather than treated as success.
+MSMF, non-JPEG modes, and cameras returning decoded images use the
 explicit FFV1 fallback. Missing FFmpeg fails with an installation/fallback message.
 FFmpeg's camera process is cancelled on Stop, including blocked pipe reads.
 Host timestamps are taken when packets reach Python, including transport delay;
@@ -222,7 +233,7 @@ Codec selection is automatic. Legacy codec settings remain loadable but no
 longer control recording. PyAV supplies the video reader/writer through the GUI extra.
 
 `frames.csv` keeps its existing columns and adds `acquisition_monotonic_ns`;
-`tracking.csv` retains its 17-column schema. Wall-clock timestamps still support
+`tracking.csv` adds `image_brightness` after its original 17 columns. Wall-clock timestamps still support
 cross-device synchronization; monotonic timestamps drive video intervals. Neither
 is a sensor exposure timestamp. MKV timestamp precision depends on the muxer
 (typically milliseconds); the CSV retains nanosecond values. The final frame's

@@ -66,7 +66,14 @@ and provenance. The workspace members live in `packages/mx-eye`,
 - Click section headings to collapse/expand sliders. Numeric boxes accept typed
   values as well as small increments. The controls scroll when space is tight.
 - **Settings:** camera index, requested mode/FPS, network addresses/ports, recording
-  location, buffer size, and codec. Changes require a stopped session.
+  location and buffer size require a stopped session. Exposure, gain and software
+  image brightness apply automatically (200 ms debounce). Settings is non-modal,
+  follows Start/Stop, and flushes pending live edits on close/before Start.
+  Other settings still use Save. A null source gain applies the camera's
+  advertised default; an explicit zero stays zero. Windows uses native DirectShow
+  controls and Linux uses V4L2. Brightness (0.1–4×, default 1×) affects tracking
+  and preview, never acquisition/recording pixels. tracking.csv appends the exact
+  multiplier per processed source frame; config.json also saves the initial value.
 - **Visible controls:** Source, Start/Stop (or Open video), and independent Record
   occupy the first row; Suspend displays is below. Source name and relevant FPS
   share the information row. Playback controls stay beside the timeline.
@@ -86,7 +93,7 @@ and provenance. The workspace members live in `packages/mx-eye`,
   every worker process receives a per-session copy.
 - **Menus:** File handles configuration/template loading and saving, video opening
   and Exit. Settings contains Camera, Network, Recording and View. View refresh
-  rate and overlays can change live; other settings require a stopped session.
+  rate, overlays, exposure, gain and image brightness can change live.
   Tools contains optional diagnostics from existing counters and GUI timing only
   while open. Calibration is a placeholder.
 
@@ -175,8 +182,8 @@ gaps. Two seconds without a decoder-accepted raw JPEG faults on the next returne
 buffer; it is not a watchdog for blocked reads. Payload decode errors use the
 same rejection/recovery policy. Windows DirectShow MJPEG uses external FFmpeg
 stream copy through NUT/pipe framing; Linux uses raw V4L2 packets. Only the Windows
-path requires the FFmpeg executable. Explicit Windows exposure/gain controls
-retain the OpenCV decoded fallback. Internal mailbox metadata includes recording
+path requires the FFmpeg executable. Windows exposure/gain uses native controls
+without switching away from packet capture. Internal mailbox metadata includes recording
 generation to avoid logging a pre-recording preview into a new recording.
 VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full

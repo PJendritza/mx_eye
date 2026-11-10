@@ -46,6 +46,11 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
             directory = Path(service.directory)
             directories.append(directory)
             wait_until(lambda: service.snapshot().stats.written >= 5)
+            tracking = service.config.value.tracking.model_copy(deep=True)
+            tracking.image_brightness = 1.75
+            service.submit('config', tracking=tracking).result(timeout=3)
+            before = service.snapshot().stats.tracked
+            wait_until(lambda: service.snapshot().stats.tracked >= before + 3)
             service.submit("record", enabled=False).result(timeout=3)
             wait_until(lambda: service.run["writer_done"].is_set()
                        and not service.run["processes"]["writer"].is_alive())
@@ -54,9 +59,11 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
             wait_until(lambda: service.snapshot().stats.tracked > before + 2)
             with (directory / "tracking.csv").open(newline="") as stream:
                 rows = list(csv.reader(stream))
-            assert len(rows[0]) == 17
+            assert len(rows[0]) == 18
+            assert rows[0][-1] == 'image_brightness'
             assert len(rows) > 1
-            assert all(len(row) == 17 for row in rows)
+            assert all(len(row) == 18 for row in rows)
+            assert any(float(row[-1]) == 1.75 for row in rows[1:])
             summary = json.loads((directory / "session.json").read_text())
             assert summary["complete"], summary
             assert summary["acquired"] == summary["written"] >= 5
@@ -216,6 +223,14 @@ def test_gui_menus_modes_and_suspended_views(monkeypatch, tmp_path):
         assert window.requested_fps.text() == "30 fps requested"
         assert config.value.source.fps == 30
         assert len(scans) == 1
+        window.settings()
+        opened_settings = window.settings_dialog
+        assert opened_settings.isVisible()
+        assert not opened_settings.isModal()
+        window.settings()
+        assert window.settings_dialog is opened_settings
+        opened_settings.close()
+        assert window.settings_dialog is None
         config.value.source = SourceConfig(**dict(config.value.source.model_dump(), fps=15))
         dialog = Settings(config, window)
         assert dialog.camera_controls.discovery is window.camera_discovery

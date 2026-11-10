@@ -48,6 +48,11 @@ def tracking_row(payload: DataFrame) -> tuple[int | float, ...]:
     )
 
 
+def recorded_tracking_row(sample):
+    payload, brightness = sample if isinstance(sample, tuple) else (sample, 1.0)
+    return (*tracking_row(payload), brightness)
+
+
 class TimestampedVideoWriter:
     """One MKV frame per acquired image; monotonic acquisition time is its PTS."""
 

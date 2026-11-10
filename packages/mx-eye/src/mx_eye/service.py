@@ -624,6 +624,25 @@ class Service:
                 if self._server_errors:
                     raise RuntimeError("; ".join(self._server_errors))
             return self.snapshot()
+        if command == 'camera_controls':
+            controls = args['controls']
+            allowed = {'exposure_mode', 'exposure_ms', 'gain'}
+            if set(controls) - allowed:
+                raise ValueError('Only exposure and gain can change during acquisition.')
+            check = MxEyeConfigStore(self.config.value.model_copy(deep=True))
+            check.value.source = check.value.source.model_copy(update=controls)
+            # Validate updates rather than relying on model_copy's unchecked update.
+            check = MxEyeConfigStore(type(check.value).model_validate(check.value.model_dump()))
+            check.value.tracking.image_brightness = args['image_brightness']
+            if self.run:
+                if self.config.value.source.mode is not SourceMode.CAMERA:
+                    raise ValueError('Live camera controls require a running camera source.')
+                self.run['capture_commands'].put_nowait(dict(command=command, controls=controls))
+                self.revision += 1
+                self.run['commands'].put_nowait(dict(command='config', revision=self.revision,
+                                                     tracking=check.value.tracking.model_copy(deep=True)))
+            self.config.replace(check.value)
+            return self.snapshot()
         if command == "config":
             check = MxEyeConfigStore(self.config.value.model_copy(deep=True))
             check.value.tracking = args["tracking"].model_copy(deep=True)

@@ -38,6 +38,7 @@ class Settings(W.QDialog):
         super().__init__(parent)
         self.config = cfg.MxEyeConfigStore(config.value.model_copy(deep=True))
         self.fields = {}
+        self.pages = {}
         self.setWindowTitle("mx_eye · Settings")
         self.resize(500, 530)
         layout = W.QVBoxLayout(self)
@@ -84,7 +85,14 @@ class Settings(W.QDialog):
             form.setVerticalSpacing(13)
             if title == "Camera":
                 self.camera_controls = CameraControls(config.value.source, self, getattr(parent, "camera_discovery", None))
+                self.camera_controls.brightness.setValue(config.value.tracking.image_brightness)
                 form.addRow(self.camera_controls)
+                hint = label('Exposure, gain and image brightness apply automatically. Use Start/Stop in the main window.', 'muted')
+                hint.setWordWrap(True)
+                form.addRow(hint)
+                self.camera_reply = W.QLabel()
+                self.camera_reply.setWordWrap(True)
+                form.addRow(self.camera_reply)
             for key, text, *args in rows:
                 value = getattr(getattr(config.value, group), key)
                 if args[0] is True:
@@ -115,22 +123,66 @@ class Settings(W.QDialog):
             note.setWordWrap(True)
             form.addRow(note)
             tabs.addTab(page, title)
-            if parent is not None and parent.service.run and title != "View":
-                page.setEnabled(False)
-        if parent is not None and parent.service.run:
-            tabs.setCurrentIndex(tabs.count() - 1)
+            self.pages[title] = page
         buttons = W.QDialogButtonBox(
-            W.QDialogButtonBox.Save | W.QDialogButtonBox.Cancel
+            W.QDialogButtonBox.Save | W.QDialogButtonBox.Close
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        for button in buttons.buttons():
+            button.setAutoDefault(False)
+            button.setDefault(False)
         layout.addWidget(buttons)
+        self.auto_apply = C.QTimer(self)
+        self.auto_apply.setSingleShot(True)
+        self.auto_apply.setInterval(200)
+        self.auto_apply.timeout.connect(self.apply_camera)
+        for widget, signal in ((self.camera_controls.exposure_mode, 'currentIndexChanged'),
+                               (self.camera_controls.exposure, 'valueChanged'),
+                               (self.camera_controls.gain_on, 'toggled'),
+                               (self.camera_controls.gain, 'valueChanged'),
+                               (self.camera_controls.brightness, 'valueChanged')):
+            getattr(widget, signal).connect(lambda *_: self.auto_apply.start())
+        self.reply_timer = C.QTimer(self)
+        self.reply_timer.timeout.connect(self.update_running_state)
+        self.reply_timer.start(150)
+        self.update_running_state()
         add_tooltips(self)
 
     def choose_folder(self):
         path = W.QFileDialog.getExistingDirectory(self, "Recording folder")
         if path:
             self.fields["recording", "directory"].setText(path)
+
+    def apply_camera(self):
+        self.auto_apply.stop()
+        if self.parent() is None:
+            return
+        if self.parent().service.config.value.source.mode is SourceMode.CAMERA:
+            self.parent().call('camera_controls', controls=self.camera_controls.live_values(),
+                               image_brightness=self.camera_controls.brightness.value())
+        else:
+            tracking = self.parent().service.config.value.tracking.model_copy(deep=True)
+            tracking.image_brightness = self.camera_controls.brightness.value()
+            self.parent().call('config', tracking=tracking)
+
+    def update_running_state(self):
+        if self.parent() is None:
+            return
+        service = self.parent().service
+        running = bool(service.run)
+        self.camera_controls.set_running(running)
+        for title in ('Network', 'Recording'):
+            self.pages[title].setEnabled(not running)
+        self.camera_reply.setText(service.camera_control_info)
+
+    def prepare_start(self):
+        """Include current camera edits even if their debounce has not fired yet."""
+        self.auto_apply.stop()
+        service = self.parent().service
+        service.config.value.source = self.camera_controls.values()
+        service.config.value.tracking.image_brightness = self.camera_controls.brightness.value()
+        self.parent().camera.setValue(service.config.value.source.camera)
 
     def accept(self):
         if self.camera_controls.process is not None:
@@ -141,8 +193,15 @@ class Settings(W.QDialog):
             )
             return
         try:
+            if self.parent() is not None:
+                # Other main-window parameters may have changed while this
+                # non-modal window was open. Preserve those current values.
+                self.config = cfg.MxEyeConfigStore(self.parent().service.config.value.model_copy(deep=True))
             if self.parent() is None or not self.parent().service.run:
                 self.config.value.source = self.camera_controls.values()
+            else:
+                self.apply_camera()
+            self.config.value.tracking.image_brightness = self.camera_controls.brightness.value()
             for (group, key), widget in self.fields.items():
                 if self.parent() is not None and self.parent().service.run and group != "display":
                     continue
@@ -164,6 +223,9 @@ class Settings(W.QDialog):
         super().accept()
 
     def done(self, result):
+        if self.auto_apply.isActive():
+            self.apply_camera()
+        self.reply_timer.stop()
         self.camera_controls.stop_scan()
         super().done(result)
 
@@ -737,6 +799,12 @@ class Window(W.QMainWindow):
                 self.call("stop")
 
     def start(self):
+        settings = getattr(self, 'settings_dialog', None)
+        if settings is not None and settings.isVisible():
+            if settings.camera_controls.process is not None:
+                W.QMessageBox.information(self, 'Camera modes', 'Wait for camera discovery to finish before starting.')
+                return
+            settings.prepare_start()
         if self.source_mode() is SourceMode.CAMERA:
             self.ensure_camera_modes()
             if self.camera_discovery.process is not None:
@@ -844,14 +912,26 @@ class Window(W.QMainWindow):
             self.call("display", suspended=display.suspended, hz=display.hz)
 
     def settings(self):
+        existing = getattr(self, 'settings_dialog', None)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
         config = cfg.MxEyeConfigStore(self.service.config.value.model_copy(deep=True))
         config.value.source.camera = self.camera.value()
         dialog = Settings(config, self)
-        if dialog.exec() == W.QDialog.Accepted:
-            if not self.service.run:
-                self.camera.setValue(dialog.config.value.source.camera)
-                self.call("settings", config=dialog.config)
-            self.apply_view_settings(dialog.config.value.display)
+        self.settings_dialog = dialog
+        def finished(result):
+            if result == W.QDialog.Accepted:
+                if not self.service.run:
+                    self.camera.setValue(dialog.config.value.source.camera)
+                    self.call("settings", config=dialog.config)
+                self.apply_view_settings(dialog.config.value.display)
+            self.settings_dialog = None
+            dialog.deleteLater()
+        dialog.finished.connect(finished)
+        dialog.show()
 
     def pause_changed(self, paused):
         self.pause.setText("Play" if paused else "Pause")
@@ -1453,6 +1533,9 @@ class Window(W.QMainWindow):
             C.QTimer.singleShot(100, self.close)
             return
         self.camera_discovery.stop()
+        settings = getattr(self, 'settings_dialog', None)
+        if settings is not None:
+            settings.close()
         try:
             self._config_snapshot().save_persistent()
         except (ValueError, OSError):

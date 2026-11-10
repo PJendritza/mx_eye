@@ -85,6 +85,7 @@ class SourceConfig(ConfigModel):
 
 
 class TrackingParameters(ConfigModel):
+    image_brightness: float = Field(default=1.0, ge=0.1, le=4.0)
     pupil_method: PupilMethod = PupilMethod.THRESHOLD
     pupil_rays: int = Field(default=48, ge=16, le=128)
     pupil_edge_contrast: int = Field(default=8, ge=1, le=100)

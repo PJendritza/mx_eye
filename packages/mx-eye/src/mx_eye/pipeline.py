@@ -27,7 +27,7 @@ from .config import (
     SourceMode,
     TrackingMode,
 )
-from .recording import TRACKING_COLUMNS, tracking_row
+from .recording import TRACKING_COLUMNS, recorded_tracking_row
 from .recording import TimestampedVideoWriter
 from .camera_backend import backend_for, camera_target, apply_controls
 from .config import TrackingConfig
@@ -219,6 +219,7 @@ def capture_worker(
     report(events, "priority", message=priority("capture"))
     source = config.value.source
     cap = None
+    native_controls = None
     reader = None
     navigation_id = 0
     fid = index = 0
@@ -237,9 +238,7 @@ def capture_worker(
             camera_settings = source.model_dump(mode="json")
             backend = backend_for(camera_settings)
             packet_capture = (os.name == "nt" and backend == cv2.CAP_DSHOW
-                              and source.fourcc in ("MJPG", "JPEG")
-                              and camera_settings.get("exposure_mode", "unchanged") == "unchanged"
-                              and camera_settings.get("gain") is None)
+                              and source.fourcc in ("MJPG", "JPEG"))
             cap = MjpegCapture(camera_settings, stop=stop) if packet_capture else cv2.VideoCapture(camera_target(camera_settings), backend)
             requests = [
                 ('width', cv2.CAP_PROP_FRAME_WIDTH, source.width),
@@ -251,12 +250,13 @@ def capture_worker(
             mode_warnings = []
             if failed_requests:
                 mode_warnings.append('Camera did not acknowledge: ' + ', '.join(failed_requests))
-            if backend == cv2.CAP_DSHOW and not packet_capture and source.fourcc in ("MJPG", "JPEG"):
-                mode_warnings.append('Decoded FFV1 fallback: manual exposure/gain uses OpenCV capture')
             if not cap.isOpened():
                 raise RuntimeError("Cannot open camera. Check camera index/backend.")
             try:
-                report(events, "source", camera_controls=apply_controls(cap, camera_settings))
+                if os.name == 'nt':
+                    from .windows_camera_controls import WindowsCameraControls
+                    native_controls = WindowsCameraControls(source.camera)
+                report(events, "source", camera_controls=apply_controls(cap, camera_settings, native_controls))
             except Exception as exc:
                 report(events, "source", camera_controls=f"Camera control request failed: {exc}")
             # V4L2 can expose original JPEG packets. Other backends deliver decoded
@@ -305,6 +305,13 @@ def capture_worker(
             try:
                 while True:
                     cmd = commands.get_nowait()
+                    if mode is SourceMode.CAMERA and cmd['command'] == 'camera_controls':
+                        camera_settings.update(cmd['controls'])
+                        try:
+                            reply = apply_controls(cap, camera_settings, native_controls)
+                        except Exception as exc:
+                            reply = f'Camera control request failed: {exc}'
+                        report(events, 'source', camera_controls=reply)
                     if mode is SourceMode.VIDEO and cmd["command"] == "speed":
                         source.speed = cmd["speed"]
                         playback_clock.reset()
@@ -488,6 +495,8 @@ def capture_worker(
             reader.close()
         if cap is not None:
             cap.release()
+        if native_controls is not None:
+            native_controls.close()
         if recording_capture_done is not None:
             recording_capture_done.value = recording_generation.value
         done.set()
@@ -655,7 +664,7 @@ def tracking_worker(
                 if samples is not None and (recording is None or (recording.is_set()
                         and frame_recording_generation == recording_generation.value)):
                     try:
-                        samples.put_nowait(payload)
+                        samples.put_nowait((payload, core.config.image_brightness))
                     except queue.Full:
                         if not stats["log_fault"].value:
                             report(
@@ -682,11 +691,11 @@ def tracking_worker(
                     revision=revision,
                 )
                 payload.update(source_index=source_index, navigation_id=navigation_id)
-                published = preview.put(current, payload, core.pupil_evidence)
+                published = preview.put(core.current_frame, payload, core.pupil_evidence)
                 if config.value.source.mode is SourceMode.VIDEO:
                     while not published and not stop.is_set():
                         stop.wait(0.001)
-                        published = preview.put(current, payload, core.pupil_evidence)
+                        published = preview.put(core.current_frame, payload, core.pupil_evidence)
                 if published:
                     last_preview = now
             if fresh is not None:
@@ -774,7 +783,7 @@ def writer_worker(
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
         fw, sw = csv.writer(frame_file), csv.writer(sample_file)
         fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns", "acquisition_monotonic_ns"])
-        sw.writerow(TRACKING_COLUMNS)
+        sw.writerow([*TRACKING_COLUMNS, 'image_brightness'])
         report(events, "writer_ready")
         while True:
             for _ in range(256):
@@ -783,7 +792,7 @@ def writer_worker(
                     if sample is None:
                         log_finished = True
                     else:
-                        sw.writerow(tracking_row(sample))
+                        sw.writerow(recorded_tracking_row(sample))
                         sample_count += 1
                 except queue.Empty:
                     break
@@ -823,7 +832,7 @@ def writer_worker(
                     try:
                         sample = samples.get_nowait()
                         if sample is not None:
-                            sw.writerow(tracking_row(sample))
+                            sw.writerow(recorded_tracking_row(sample))
                             sample_count += 1
                     except queue.Empty:
                         break

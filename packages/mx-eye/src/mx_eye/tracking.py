@@ -64,7 +64,10 @@ class Tracker:
         self.pupil_evidence = None
 
     def process(self, frame, frame_id, advance=True, frame_delta=1):
-        self.current_frame = frame
+        # The acquired frame remains untouched for recording. Use the same
+        # operation offline with the multiplier stored beside each sample.
+        self.current_frame = (frame if self.config.image_brightness == 1.0 else
+                              cv2.convertScaleAbs(frame, alpha=self.config.image_brightness))
         self._gray_cache = None
         self.pupil_evidence = None
         self.reject_reason = ''

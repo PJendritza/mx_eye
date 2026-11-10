@@ -615,6 +615,9 @@ class Service:
                     "Stop the session before changing source/network/recording settings."
                 )
             updated = MxEyeConfigStore(args["config"].value.model_copy(deep=True))
+            # Calibration is selected explicitly in its workspace, independently
+            # of source/video/settings files. Never replace it as a side effect.
+            updated.value.calibration = self.config.value.calibration
             network_changed = updated.value.network != self.config.value.network
             self.config.replace(updated.value)
             if network_changed:

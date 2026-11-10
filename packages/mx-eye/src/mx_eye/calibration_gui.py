@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
+from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6 import QtCore as C
@@ -104,6 +105,9 @@ class CalibrationWindow(W.QMainWindow):
         self.animal = W.QLineEdit()
         self.animal.editingFinished.connect(self._load_animal)
         form.addRow("Animal ID", self.animal)
+        load = W.QPushButton('Load calibration…')
+        load.clicked.connect(self._import_profile)
+        form.addRow(load)
         self.width = self._integer(1, 32768)
         self.height = self._integer(1, 32768)
         form.addRow("Screen width", self.width)
@@ -174,7 +178,12 @@ class CalibrationWindow(W.QMainWindow):
         slider.setRange(low * scale, high * scale)
         slider.setValue(round(box.value() * scale))
         slider.valueChanged.connect(lambda value: box.setValue(value / scale))
-        box.valueChanged.connect(lambda value: slider.setValue(round(value * scale)))
+        def follow(value):
+            # The numeric editor can hold imported values outside the slider's
+            # convenient range; moving the slider must not clamp that profile.
+            with C.QSignalBlocker(slider):
+                slider.setValue(round(value * scale))
+        box.valueChanged.connect(follow)
         layout.addWidget(slider, 1)
         layout.addWidget(box)
         return widget
@@ -208,13 +217,28 @@ class CalibrationWindow(W.QMainWindow):
             profile.rotation_deg,
         )
         for editor, value in zip(self._editors, values, strict=True):
+            # Imported values must not be silently clipped to the slider range.
+            editor.setRange(min(editor.minimum(), value), max(editor.maximum(), value))
             editor.setValue(value)
         self._loading = False
         self.status.setText(
             f"Active · {profile.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         self._update_screen(fit=True)
+        self._redraw()
         self.profileChanged.emit(profile)
+
+    def _import_profile(self) -> None:
+        path, _ = W.QFileDialog.getOpenFileName(self, 'Load calibration', '', 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            profile = self.store.import_profile(Path(path))
+        except (OSError, TypeError, ValueError) as exc:
+            W.QMessageBox.warning(self, 'Cannot load calibration', str(exc))
+            return
+        self._load_profile(profile)
+        self.status.setText(f'Loaded and active · {Path(path).name} · {profile.animal_id}')
 
     def _profile_from_controls(self) -> CalibrationProfile:
         animal = self.animal.text().strip() or "default"

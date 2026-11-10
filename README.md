@@ -131,6 +131,15 @@ tracking and its preview. Original video is unchanged. The exact operation is
 `cv2.convertScaleAbs(frame, alpha=image_brightness)`; each `tracking.csv` row
 stores its multiplier so changes can be reproduced for that source frame.
 
+In **Calibration**, use **Load calibration…** to select an mx_calibrator/mx_eye
+profile JSON. It applies immediately and is copied into the local calibration
+folder for restoration at restart. Opening a video, loading a configuration or
+editing tracking/camera settings does not replace the selected profile; calibration
+changes are explicit in the calibration workspace. A profile is only applied when
+its declared input matches the tracking mode; otherwise the main status says it
+is inactive. The preview's 90° CCW rotation is display-only; output remains in
+Pygame screen pixels with the JSON's signed gains, rotation and screen-axis offsets.
+
 The source controls show Start/Stop for camera and simulation, or Open video for
 file playback. Switching source stops the current session. **Record** starts and
 stops recording independently; tracking starts without recording. Each recording

@@ -636,7 +636,8 @@ def tracking_worker(
                     flags |= TrackingFlags.SIMULATION
                 send = time.time_ns()
                 output_x, output_y = result["x"], result["y"]
-                if active_calibration is not None and result["valid"]:
+                if (active_calibration is not None and result["valid"]
+                        and active_calibration.matches_tracking(core.config)):
                     output_x, output_y = active_calibration.apply(output_x, output_y)
                     if math.isfinite(output_x) and math.isfinite(output_y):
                         flags |= TrackingFlags.CALIBRATED

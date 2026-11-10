@@ -95,7 +95,11 @@ and provenance. The workspace members live in `packages/mx-eye`,
   and Exit. Settings contains Camera, Network, Recording and View. View refresh
   rate, overlays, exposure, gain and image brightness can change live.
   Tools contains optional diagnostics from existing counters and GUI timing only
-  while open. Calibration is a placeholder.
+  while open. Calibration opens the non-modal workspace; Load calibration imports
+  mx_calibrator-compatible JSON, preserving its identity and transform, and saves
+  a local active copy. Source/video/settings changes preserve the active profile.
+  Only a matching declared input coordinate system is calibrated; mismatches stay
+  loaded but are labelled inactive. Preview rotation is never sent over the network.
 
 Camera index 0 is usually the first camera. On Windows, Auto chooses DirectShow;
 MSMF is available if the camera works better with that backend. Set a camera mode

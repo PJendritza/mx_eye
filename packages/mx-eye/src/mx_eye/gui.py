@@ -1342,6 +1342,12 @@ class Window(W.QMainWindow):
             f"{state.state.upper()}  ·  {state.message}"
             + (f"   {state.directory}" if state.directory else "")
         )
+        profile = self.service.config.value.calibration
+        if profile is not None:
+            calibration_text = (f'Calibration: {profile.animal_id}'
+                                if profile.matches_tracking(self.service.config.value.tracking)
+                                else f'Calibration inactive: requires {profile.input_coordinate_system}')
+            self.status.setText(self.status.text() + '  ·  ' + calibration_text)
         if video and self.navigation_pending is not None:
             self.status.setText("Seeking video frame…")
         stats = state.stats

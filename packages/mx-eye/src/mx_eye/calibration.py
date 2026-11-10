@@ -87,6 +87,16 @@ class CalibrationProfile(BaseModel):
             center_y + sine * dx + cosine * dy + self.offset_y,
         )
 
+    def matches_tracking(self, tracking: Any) -> bool:
+        """A profile stays loaded, but must only transform its declared input."""
+        system = (tracking.pupil_coordinates.value if tracking.tracking_mode == 'Pupil only'
+                  else 'pupil_minus_cr')
+        if system == 'absolute':
+            system = 'image_absolute'
+        elif system == 'relative':
+            system = 'roi_relative'
+        return self.input_coordinate_system == system
+
     def as_new_version(self) -> Self:
         return self.model_copy(
             update={"calibration_id": uuid4(), "created_at": datetime.now(UTC)}
@@ -148,8 +158,8 @@ class CalibrationStore:
             raise TypeError("Invalid calibration index")
         return raw
 
-    def save_and_activate(self, profile: CalibrationProfile) -> Path:
-        saved = profile.as_new_version()
+    def save_and_activate(self, profile: CalibrationProfile, *, new_version: bool = True) -> Path:
+        saved = profile.as_new_version() if new_version else profile
         animal = self._safe_animal_id(saved.animal_id)
         stamp = saved.created_at.astimezone(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
         relative = Path(animal) / f"{stamp}.json"
@@ -166,6 +176,12 @@ class CalibrationStore:
             {"version": 1, "last_animal": saved.animal_id, "active": active},
         )
         return path
+
+    def import_profile(self, path: Path) -> CalibrationProfile:
+        """Keep a local copy of an external profile, with its original identity."""
+        profile = CalibrationProfile.model_validate_json(path.read_text(encoding='utf-8'))
+        self.save_and_activate(profile, new_version=False)
+        return profile
 
     def load_active(self, animal_id: str) -> CalibrationProfile | None:
         active = self._read_index().get("active", {})

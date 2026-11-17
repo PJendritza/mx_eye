@@ -3,6 +3,7 @@ from PySide6 import QtWidgets as W
 
 TIPS={
  'pupil_thr':'Original threshold method only: pixels darker than this intensity are pupil candidates (0–255). Raising it may include iris or eyelashes.',
+ 'pupil_mask_cleanup':'Threshold and adaptive methods: radius in source pixels of a morphological opening applied to the dark mask. It removes dark bridges and specks narrower than about twice this radius, separating the pupil from touching eyelids, shadows or lashes, then restores the remaining shapes. 0 turns it off. Use the smallest value that separates them.',
  'pupil_rays':'Starburst-style: number of outward rays used to find dark-to-light pupil edges. More rays supply more points but require more work.',
  'pupil_edge_contrast':'Minimum outward brightness increase (0–255 units). Starburst checks across two radial pixels; both edge methods also require a darker interior than exterior. Lower values admit weaker edges and more noise.',
  'pupil_edge_threshold':'Edge + ellipse: lower Canny gradient threshold; the upper threshold is twice this value. Raise it to suppress weak/noisy edges.',

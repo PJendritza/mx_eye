@@ -10,6 +10,20 @@ import numpy as np
 from .config import PUPIL_METHODS, PupilMethod, PupilCoordinates, TrackingConfig, TrackingMode
 from .pupil_methods import adaptive_mask, detect_edges
 
+def clean_mask(mask, radius):
+    """Morphological opening with a disk: cut bridges narrower than ~2*radius.
+
+    Erosion removes every dark structure thinner than the disk, including the
+    neck joining the pupil to an eyelid or shadow; dilation then restores the
+    surviving shapes to their original outline. Radius 0 leaves the mask as is.
+    """
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+
 class TrackState:
 
     def __init__(self):
@@ -456,6 +470,7 @@ class Tracker:
         method = self.config.pupil_method
         if method in (PupilMethod.THRESHOLD, PupilMethod.ADAPTIVE):
             pupil_mask = cv2.compare(gray, pthr, cv2.CMP_LT) if method is PupilMethod.THRESHOLD else adaptive_mask(gray, self.config.model_dump(mode="json"))
+            pupil_mask = clean_mask(pupil_mask, self.config.pupil_mask_cleanup)
             self.pupil_evidence = pupil_mask
             pupil_candidates = self.component_candidates(pupil_mask, pmin, pmax, x, y, 'pupil')
         else:

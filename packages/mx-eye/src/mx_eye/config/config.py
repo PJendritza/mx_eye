@@ -94,6 +94,7 @@ class TrackingParameters(ConfigModel):
     pupil_adaptive_window: int = Field(default=61, ge=3, le=301)
     pupil_adaptive_offset: int = Field(default=7, ge=0, le=50)
     pupil_thr: int = Field(default=48, ge=0, le=255)
+    pupil_mask_cleanup: int = Field(default=0, ge=0, le=10)
     pupil_min: int = Field(default=30, ge=0)
     pupil_max: int = Field(default=3000, ge=0)
     cr_thr: int = Field(default=181, ge=0, le=255)

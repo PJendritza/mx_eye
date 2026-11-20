@@ -161,6 +161,29 @@ to the sibling `mx_eye_data` directory. Use `mx-eye --data-dir PATH` or set
 `MX_EYE_DATA_DIR` to choose another location. The complete current configuration,
 including tracking parameters and ROI, is saved when the application closes.
 
+### Offline tracker comparison
+
+Run the [comparison tool](scripts/mx_eye_tracker_compare.py) from the repository
+root with the MX Eye GUI dependencies:
+
+```bash
+uv run --package mx-eye --extra gui python scripts/mx_eye_tracker_compare.py
+```
+
+Open a recording's `video.mkv` to use its saved settings, template and per-frame
+brightness. Both trackers process the same frames. Use **Copy A → B** to match
+the settings while keeping B's pupil method and center estimator, then change
+one option and compare the traces. **Timing details…** reports the median,
+95th-percentile, and paired difference in milliseconds per frame, excluding
+video decoding and drawing. Mask cleanup, bilinear upsampling and adjustable
+blur in this tool are experiments for recorded video.
+
+In one 386-frame comparison, both sides used Threshold, ellipse fit and a
+4 px cleanup radius. Switching from native sampling with blur off to 2× bilinear
+with blur σ = 0.6 px added a median of **0.176 ms per frame**. Template following
+took about 5 ms per frame on that machine. A separate visual check favored a
+5 px cleanup radius. Both observations are specific to the tested setup.
+
 ### Timestamped recording and playback
 
 New recording folders use local date and time, for example

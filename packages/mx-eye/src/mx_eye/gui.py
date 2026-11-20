@@ -13,6 +13,7 @@ from PySide6 import QtGui as G
 from PySide6 import QtWidgets as W
 
 from . import config as cfg
+from . import runtime_log
 from .calibration import CalibrationStore
 from .calibration_gui import CalibrationWindow
 from .cameras import CameraControls, CameraModeDiscovery
@@ -342,6 +343,7 @@ class Window(W.QMainWindow):
         self.menuBar().addAction("Calibration", self.show_calibration)
         tools = self.menuBar().addMenu("Tools")
         tools.addAction("Timing / performance diagnostics…", self.show_diagnostics)
+        tools.addAction("Runtime log folder…", self.show_runtime_log)
         self.diagnostics = None
         self.diagnostic_values = {}
         self.source.currentIndexChanged.connect(self.source_controls_changed)
@@ -1069,6 +1071,25 @@ class Window(W.QMainWindow):
             f"Settings and animal calibrations are stored in:\n\n{data_root()}\n\n"
             "Start mx_eye with --data-dir PATH to use another directory.",
         )
+
+    def show_runtime_log(self):
+        folder = runtime_log.directory()
+        if folder is None:
+            W.QMessageBox.information(
+                self, "Runtime log", "The runtime log is not active in this launch."
+            )
+            return
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Runtime log")
+        box.setText(
+            f"This launch logs errors, worker exits and system health to:\n\n{folder}\n\n"
+            f"Earlier launches are kept beside it in {folder.parent}."
+        )
+        open_button = box.addButton("Open folder", W.QMessageBox.ActionRole)
+        box.addButton(W.QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            G.QDesktopServices.openUrl(C.QUrl.fromLocalFile(str(folder)))
 
     def save_template(self):
         template = self.service.config.value.template

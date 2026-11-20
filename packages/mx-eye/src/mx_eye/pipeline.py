@@ -4,6 +4,7 @@ import base64
 import contextlib
 import csv
 import json
+import logging
 import math
 import os
 import queue
@@ -14,6 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import psutil
+from . import runtime_log
 from .camera_diagnostics import CameraPacketGuard, save_recording_rejections
 from .mjpeg_capture import MjpegCapture
 from .paths import data_root
@@ -35,6 +37,8 @@ from .tracking import Tracker
 from .transport import Publisher
 from .video import PlaybackClock, VideoReader
 from .simulation import Simulation
+
+logger = logging.getLogger(__name__)
 
 
 class Mailbox:
@@ -216,6 +220,7 @@ def capture_worker(
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
+    runtime_log.attach_worker("capture")
     report(events, "priority", message=priority("capture"))
     source = config.value.source
     cap = None
@@ -258,6 +263,7 @@ def capture_worker(
                     native_controls = WindowsCameraControls(source.camera)
                 report(events, "source", camera_controls=apply_controls(cap, camera_settings, native_controls))
             except Exception as exc:
+                logger.warning("Camera control request failed", exc_info=True)
                 report(events, "source", camera_controls=f"Camera control request failed: {exc}")
             # V4L2 can expose original JPEG packets. Other backends deliver decoded
             # pixels, which are recorded losslessly with FFV1.
@@ -310,6 +316,7 @@ def capture_worker(
                         try:
                             reply = apply_controls(cap, camera_settings, native_controls)
                         except Exception as exc:
+                            logger.warning("Live camera control request failed", exc_info=True)
                             reply = f'Camera control request failed: {exc}'
                         report(events, 'source', camera_controls=reply)
                     if mode is SourceMode.VIDEO and cmd["command"] == "speed":
@@ -488,6 +495,7 @@ def capture_worker(
             if mode is SourceMode.SIMULATION:
                 due = max(due + 1 / (fps * source.speed), time.perf_counter())
     except Exception as exc:
+        logger.exception("Acquisition failed")
         stats["capture_fault"].value = 1
         report(events, "error", message=str(exc))
     finally:
@@ -520,6 +528,7 @@ def tracking_worker(
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
     recording_marker_generation = 0
+    runtime_log.attach_worker("tracking")
     report(events, "priority", message=priority("tracking"))
     core = Tracker(config.value.tracking)
     active_calibration = config.value.calibration
@@ -704,6 +713,7 @@ def tracking_worker(
             if finishing:
                 break
     except Exception as exc:
+        logger.exception("Tracking failed")
         stats["tracking_fault"].value = 1
         report(events, "error", message=f"Tracking: {exc}")
         stop.set()
@@ -767,6 +777,7 @@ def writer_worker(
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
+    runtime_log.attach_worker("recording")
     report(events, "priority", message=priority("recording"))
     folder = Path(directory)
     writer = None
@@ -839,6 +850,7 @@ def writer_worker(
                         break
                 break
     except Exception as exc:
+        logger.exception("Recording failed")
         error = str(exc)
         stats["record_fault"].value = 2
         report(

@@ -194,6 +194,25 @@ declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside
 the camera or USB driver. `tracking_log_complete` separately reports log overflow.
 
+## Runtime log (crash / power-loss diagnostics)
+
+Every launch writes `mx_eye_data/logs/<YYYYmmdd-HHMMSS>-pid<pid>/` (Tools →
+Runtime log folder…). `mx_eye.log` collects the GUI/supervisor and all worker
+processes: session start/stop, recording start/stop, worker errors with full
+tracebacks, decoded worker exit codes (for example `killed by SIGKILL`, often the
+out-of-memory killer), received SIGTERM/SIGHUP/SIGQUIT, Qt warnings, and a
+`health` line every 5 s (CPU temperature, Raspberry Pi `get_throttled`
+under-voltage/throttling flags, Pi 5 USB-C input voltage, CPU, load, memory,
+swap, mx_eye RSS, free recording disk, tracker state). Flag changes are logged
+as warnings. Warnings, errors and health lines are fsynced so the last lines
+survive power loss. `faults.log` holds faulthandler dumps of native crashes;
+`status.json` gains `clean_exit` only on a normal close. On the next launch an
+unclean previous folder is reported, classified by boot ID as a system restart /
+power loss or as the process being killed while the system kept running, with
+its last line and last health line. The newest 50 launch folders are kept.
+Workers join the log through the `MX_EYE_RUNTIME_LOG_DIR` environment variable.
+Diagnostics never block startup: if the folder cannot be created, logging stays off.
+
 ## SDK details
 
 The public handle is `MxEye`; `MxEye`, `MxEyeConfig` and `Sample` are exported

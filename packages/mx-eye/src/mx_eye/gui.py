@@ -571,6 +571,7 @@ class Window(W.QMainWindow):
                 True,
                 [
                     ("pupil_thr", "Dark threshold", 0, 255, 1),
+                    ("pupil_mask_cleanup", "Mask cleanup", 0, 10, 1),
                     ("pupil_min", "Minimum area", 1, 3000, 1),
                     ("pupil_max", "Maximum area", 10, 15000, 10),
                 ],
@@ -719,6 +720,8 @@ class Window(W.QMainWindow):
                         or (key.startswith("pupil_adaptive") and method is PupilMethod.ADAPTIVE))
             self.parameters[key].setEnabled(relevant)
         self.parameters["pupil_thr"].setEnabled(method is PupilMethod.THRESHOLD)
+        self.parameters["pupil_mask_cleanup"].setEnabled(
+            method in (PupilMethod.THRESHOLD, PupilMethod.ADAPTIVE))
 
     def update_alert(self, *args):
         now = time.monotonic()

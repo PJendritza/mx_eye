@@ -28,8 +28,8 @@ class CalibrationWindow(W.QMainWindow):
         super().__init__(parent)
         self.store = store
         self.profile = profile or CalibrationProfile(animal_id="default")
-        self._last_raw: tuple[float, float] | None = None
-        self._history: deque[tuple[float, float, float]] = deque()
+        self._last_raw: tuple[float, float, float] | None = None
+        self._history: deque[tuple[float, float, float, float]] = deque()
         self._loading = False
         self._screen_size: tuple[int, int] | None = None
         self.setWindowTitle("mx_eye · Calibration workspace")
@@ -128,6 +128,23 @@ class CalibrationWindow(W.QMainWindow):
         form.addRow(
             "Rotation (deg)", self._with_slider(self.rotation, -180, 180, 10)
         )
+        head = W.QLabel("Head compensation (x)")
+        head.setToolTip(
+            "Removes the drift of the eye signal with head position, as fitted in "
+            "mx_calibrator: x becomes x − k · (CR x − CR x reference) before the "
+            "transform. k = 0 turns it off. Requires Pupil + CR tracking: samples "
+            "without a corneal reflection have no calibrated position."
+        )
+        form.addRow(head)
+        self.head_slope = self._number(-100, 100, 4)
+        self.head_slope.setToolTip("k: change of the raw x signal per pixel of CR x. 0 = off.")
+        form.addRow("k (slope)", self.head_slope)
+        self.head_ref = self._number(-32768, 32768, 1)
+        self.head_ref.setToolTip(
+            "CR x reference in camera-image pixels: the head position at which no "
+            "correction is applied."
+        )
+        form.addRow("CR x reference (px)", self.head_ref)
 
         center = W.QPushButton("Set current eye position to screen centre")
         center.clicked.connect(self._set_current_as_center)
@@ -162,6 +179,8 @@ class CalibrationWindow(W.QMainWindow):
             self.gain_x,
             self.gain_y,
             self.rotation,
+            self.head_slope,
+            self.head_ref,
         )
         for editor in self._editors:
             editor.valueChanged.connect(self._controls_changed)
@@ -215,6 +234,8 @@ class CalibrationWindow(W.QMainWindow):
             profile.gain_x,
             profile.gain_y,
             profile.rotation_deg,
+            profile.head_comp_x_slope,
+            profile.head_comp_x_ref,
         )
         for editor, value in zip(self._editors, values, strict=True):
             # Imported values must not be silently clipped to the slider range.
@@ -252,6 +273,8 @@ class CalibrationWindow(W.QMainWindow):
             gain_x=self.gain_x.value(),
             gain_y=self.gain_y.value(),
             rotation_deg=self.rotation.value(),
+            head_comp_x_slope=self.head_slope.value(),
+            head_comp_x_ref=self.head_ref.value(),
         )
         return CalibrationProfile.model_validate(data)
 
@@ -335,7 +358,11 @@ class CalibrationWindow(W.QMainWindow):
         if self._last_raw is None:
             self.status.setText("No valid eye position is available yet")
             return
-        raw_x, raw_y = self._last_raw
+        raw_x, raw_y, cr_x = self._last_raw
+        raw_x = self.profile.compensate_x(raw_x, cr_x)
+        if not math.isfinite(raw_x):
+            self.status.setText("Head compensation needs a corneal reflection")
+            return
         theta = math.radians(self.rotation.value())
         cosine, sine = math.cos(theta), math.sin(theta)
         scaled_x = raw_x * self.gain_x.value()
@@ -366,11 +393,12 @@ class CalibrationWindow(W.QMainWindow):
             f"{saved.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-    def update_sample(self, x: float, y: float) -> None:
+    def update_sample(self, x: float, y: float, cr_x: float = math.nan) -> None:
+        """Add one uncalibrated sample; cr_x is used by head compensation."""
         if not (math.isfinite(x) and math.isfinite(y)):
             return
-        self._last_raw = (x, y)
-        self._history.append((time.monotonic(), x, y))
+        self._last_raw = (x, y, cr_x)
+        self._history.append((time.monotonic(), x, y, cr_x))
         self._redraw()
 
     def _redraw(self, *_args) -> None:
@@ -388,10 +416,16 @@ class CalibrationWindow(W.QMainWindow):
             self.trace.setData([], [])
             self.current.setData([], [])
             return
+        screen_points = [self.profile.apply(*point[1:]) for point in points]
         displayed_points = [
-            self._display_point(*self.profile.apply(point[1], point[2]))
-            for point in points
+            self._display_point(x, y)
+            for x, y in screen_points
+            if math.isfinite(x) and math.isfinite(y)
         ]
+        if not displayed_points:
+            self.trace.setData([], [])
+            self.current.setData([], [])
+            return
         count = len(displayed_points)
         brushes = [
             pg.mkBrush(255, 64, 87, max(18, round(210 * (i + 1) / count)))

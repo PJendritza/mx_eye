@@ -1437,7 +1437,9 @@ class Window(W.QMainWindow):
             payload = self.last_payload
         r = payload["result"]
         if fresh_payload and self.calibration_window is not None:
-            self.calibration_window.update_sample(r["x"], r["y"])
+            cr = r.get("cr")
+            self.calibration_window.update_sample(
+                r["x"], r["y"], cr["x"] if cr else float("nan"))
         full_params = payload["tracking"].model_copy(
             update={"template_radius": self.parameters["template_radius"].spin.value()}
         )

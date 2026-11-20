@@ -100,6 +100,13 @@ and provenance. The workspace members live in `packages/mx-eye`,
   a local active copy. Source/video/settings changes preserve the active profile.
   Only a matching declared input coordinate system is calibrated; mismatches stay
   loaded but are labelled inactive. Preview rotation is never sent over the network.
+- **Head compensation (x):** calibration profiles accept mx_calibrator's
+  `head_comp_x_slope` (k) and `head_comp_x_ref` (CR x reference, camera pixels);
+  enter them in the calibration workspace or load an mx_calibrator export.
+  Before the transform, x becomes `x - k * (cr_x - ref)`; k = 0 is off and such
+  profiles are saved without these keys, as before. A compensated sample without
+  a corneal reflection has no calibrated position and is sent without VALID. Only
+  k and the reference are applied here; fitting them stays in mx_calibrator.
 
 Camera index 0 is usually the first camera. On Windows, Auto chooses DirectShow;
 MSMF is available if the camera works better with that backend. Set a camera mode

@@ -13,6 +13,7 @@ from PySide6 import QtGui as G
 from PySide6 import QtWidgets as W
 
 from . import config as cfg
+from . import runtime_log
 from .calibration import CalibrationStore
 from .calibration_gui import CalibrationWindow
 from .cameras import CameraControls, CameraModeDiscovery
@@ -342,6 +343,7 @@ class Window(W.QMainWindow):
         self.menuBar().addAction("Calibration", self.show_calibration)
         tools = self.menuBar().addMenu("Tools")
         tools.addAction("Timing / performance diagnostics…", self.show_diagnostics)
+        tools.addAction("Runtime log folder…", self.show_runtime_log)
         self.diagnostics = None
         self.diagnostic_values = {}
         self.source.currentIndexChanged.connect(self.source_controls_changed)
@@ -569,6 +571,7 @@ class Window(W.QMainWindow):
                 True,
                 [
                     ("pupil_thr", "Dark threshold", 0, 255, 1),
+                    ("pupil_mask_cleanup", "Mask cleanup", 0, 10, 1),
                     ("pupil_min", "Minimum area", 1, 3000, 1),
                     ("pupil_max", "Maximum area", 10, 15000, 10),
                 ],
@@ -717,6 +720,8 @@ class Window(W.QMainWindow):
                         or (key.startswith("pupil_adaptive") and method is PupilMethod.ADAPTIVE))
             self.parameters[key].setEnabled(relevant)
         self.parameters["pupil_thr"].setEnabled(method is PupilMethod.THRESHOLD)
+        self.parameters["pupil_mask_cleanup"].setEnabled(
+            method in (PupilMethod.THRESHOLD, PupilMethod.ADAPTIVE))
 
     def update_alert(self, *args):
         now = time.monotonic()
@@ -1070,6 +1075,25 @@ class Window(W.QMainWindow):
             "Start mx_eye with --data-dir PATH to use another directory.",
         )
 
+    def show_runtime_log(self):
+        folder = runtime_log.directory()
+        if folder is None:
+            W.QMessageBox.information(
+                self, "Runtime log", "The runtime log is not active in this launch."
+            )
+            return
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Runtime log")
+        box.setText(
+            f"This launch logs errors, worker exits and system health to:\n\n{folder}\n\n"
+            f"Earlier launches are kept beside it in {folder.parent}."
+        )
+        open_button = box.addButton("Open folder", W.QMessageBox.ActionRole)
+        box.addButton(W.QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            G.QDesktopServices.openUrl(C.QUrl.fromLocalFile(str(folder)))
+
     def save_template(self):
         template = self.service.config.value.template
         if not template:
@@ -1413,7 +1437,9 @@ class Window(W.QMainWindow):
             payload = self.last_payload
         r = payload["result"]
         if fresh_payload and self.calibration_window is not None:
-            self.calibration_window.update_sample(r["x"], r["y"])
+            cr = r.get("cr")
+            self.calibration_window.update_sample(
+                r["x"], r["y"], cr["x"] if cr else float("nan"))
         full_params = payload["tracking"].model_copy(
             update={"template_radius": self.parameters["template_radius"].spin.value()}
         )

@@ -647,9 +647,14 @@ def tracking_worker(
                 output_x, output_y = result["x"], result["y"]
                 if (active_calibration is not None and result["valid"]
                         and active_calibration.matches_tracking(core.config)):
-                    output_x, output_y = active_calibration.apply(output_x, output_y)
+                    output_x, output_y = active_calibration.apply(
+                        output_x, output_y, cr["x"] if cr else nan)
                     if math.isfinite(output_x) and math.isfinite(output_y):
                         flags |= TrackingFlags.CALIBRATED
+                    else:
+                        # Head compensation needs a CR; without one there is
+                        # no calibrated position, so the sample is not valid.
+                        flags &= ~TrackingFlags.VALID
                 payload = DataFrame(
                     session=session,
                     sequence=seq,

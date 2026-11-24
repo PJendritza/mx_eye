@@ -100,6 +100,13 @@ and provenance. The workspace members live in `packages/mx-eye`,
   a local active copy. Source/video/settings changes preserve the active profile.
   Only a matching declared input coordinate system is calibrated; mismatches stay
   loaded but are labelled inactive. Preview rotation is never sent over the network.
+- **Head compensation (x):** calibration profiles accept mx_calibrator's
+  `head_comp_x_slope` (k) and `head_comp_x_ref` (CR x reference, camera pixels);
+  enter them in the calibration workspace or load an mx_calibrator export.
+  Before the transform, x becomes `x - k * (cr_x - ref)`; k = 0 is off and such
+  profiles are saved without these keys, as before. A compensated sample without
+  a corneal reflection has no calibrated position and is sent without VALID. Only
+  k and the reference are applied here; fitting them stays in mx_calibrator.
 
 Camera index 0 is usually the first camera. On Windows, Auto chooses DirectShow;
 MSMF is available if the camera works better with that backend. Set a camera mode
@@ -193,6 +200,25 @@ VFR header frame-count estimates are not used to
 declare a recording incomplete. This is not a full
 post-recording decode of every frame. The backend cannot expose frames lost inside
 the camera or USB driver. `tracking_log_complete` separately reports log overflow.
+
+## Runtime log (crash / power-loss diagnostics)
+
+Every launch writes `mx_eye_data/logs/<YYYYmmdd-HHMMSS>-pid<pid>/` (Tools →
+Runtime log folder…). `mx_eye.log` collects the GUI/supervisor and all worker
+processes: session start/stop, recording start/stop, worker errors with full
+tracebacks, decoded worker exit codes (for example `killed by SIGKILL`, often the
+out-of-memory killer), received SIGTERM/SIGHUP/SIGQUIT, Qt warnings, and a
+`health` line every 5 s (CPU temperature, Raspberry Pi `get_throttled`
+under-voltage/throttling flags, Pi 5 USB-C input voltage, CPU, load, memory,
+swap, mx_eye RSS, free recording disk, tracker state). Flag changes are logged
+as warnings. Warnings, errors and health lines are fsynced so the last lines
+survive power loss. `faults.log` holds faulthandler dumps of native crashes;
+`status.json` gains `clean_exit` only on a normal close. On the next launch an
+unclean previous folder is reported, classified by boot ID as a system restart /
+power loss or as the process being killed while the system kept running, with
+its last line and last health line. The newest 50 launch folders are kept.
+Workers join the log through the `MX_EYE_RUNTIME_LOG_DIR` environment variable.
+Diagnostics never block startup: if the folder cannot be created, logging stays off.
 
 ## SDK details
 

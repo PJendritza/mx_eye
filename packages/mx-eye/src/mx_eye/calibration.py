@@ -37,6 +37,11 @@ class CalibrationProfile(BaseModel):
     gain_x: float = 1.0
     gain_y: float = 1.0
     rotation_deg: float = 0.0
+    # Head compensation (x), as in mx_calibrator: before the transform,
+    # x becomes x - head_comp_x_slope * (cr_x - head_comp_x_ref). A slope of 0
+    # disables it, and such profiles are saved without these two keys.
+    head_comp_x_slope: float = 0.0
+    head_comp_x_ref: float = 0.0
 
     @model_validator(mode="before")
     @classmethod
@@ -73,8 +78,29 @@ class CalibrationProfile(BaseModel):
     def screen_center(self) -> tuple[float, float]:
         return self.screen_width / 2, self.screen_height / 2
 
-    def apply(self, x: float, y: float) -> tuple[float, float]:
-        """Transform one raw point into top-left-origin screen pixels."""
+    @property
+    def head_compensated(self) -> bool:
+        return self.head_comp_x_slope != 0
+
+    def compensate_x(self, x: float, cr_x: float = math.nan) -> float:
+        """x with the head-position trend removed: x - k * (cr_x - reference).
+
+        Without compensation x is unchanged. With it, a sample lacking a
+        corneal-reflection position becomes NaN, because it cannot be corrected.
+        """
+        if not self.head_compensated:
+            return x
+        if not math.isfinite(cr_x):
+            return math.nan
+        return x - self.head_comp_x_slope * (cr_x - self.head_comp_x_ref)
+
+    def apply(self, x: float, y: float, cr_x: float = math.nan) -> tuple[float, float]:
+        """Transform one raw point into top-left-origin screen pixels.
+
+        ``cr_x`` is the sample's corneal-reflection x in the camera image; only
+        head compensation uses it.
+        """
+        x = self.compensate_x(x, cr_x)
         if not (math.isfinite(x) and math.isfinite(y)):
             return math.nan, math.nan
         dx = x * self.gain_x
@@ -96,6 +122,11 @@ class CalibrationProfile(BaseModel):
         elif system == 'relative':
             system = 'roi_relative'
         return self.input_coordinate_system == system
+
+    def dump(self) -> dict[str, Any]:
+        """JSON for disk; without head compensation, exactly the 1.1.0 keys."""
+        exclude = None if self.head_compensated else {"head_comp_x_slope", "head_comp_x_ref"}
+        return self.model_dump(mode="json", exclude=exclude)
 
     def as_new_version(self) -> Self:
         return self.model_copy(
@@ -164,7 +195,7 @@ class CalibrationStore:
         stamp = saved.created_at.astimezone(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
         relative = Path(animal) / f"{stamp}.json"
         path = self.root / relative
-        self._write_json(path, saved.model_dump(mode="json"))
+        self._write_json(path, saved.dump())
         index = self._read_index()
         active_value = index.get("active", {})
         if not isinstance(active_value, dict):

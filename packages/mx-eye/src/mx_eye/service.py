@@ -3,8 +3,10 @@
 import base64
 import concurrent.futures
 import json
+import logging
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -37,6 +39,23 @@ from .pipeline import (
     tracking_worker,
     writer_worker,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def describe_exitcode(code):
+    """Readable process exit code; negative codes are terminating signals."""
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        hint = " (often the out-of-memory killer)" if name == "SIGKILL" else ""
+        return f"killed by {name}{hint}"
+    return f"exit code {code}"
+
 
 STAT_NAMES = (
     "acquired",
@@ -295,6 +314,22 @@ class Service:
         self.directory = ""
         self.state, self.message = "starting", "Opening source…"
         self.run = run
+        source = config.value.source
+        if source.mode is SourceMode.CAMERA:
+            detail = (
+                f"camera={source.camera} {source.width}x{source.height}@{source.fps} "
+                f"{source.fourcc} backend={source.backend.value}"
+            )
+        elif source.mode is SourceMode.VIDEO:
+            detail = f"video={source.path or '-'}"
+        else:
+            detail = f"{source.width}x{source.height}@{source.fps}"
+        logger.info(
+            "Session %s starting: source=%s %s",
+            self.session,
+            source.mode.value,
+            detail,
+        )
         try:
             run["writer_done"].set()
             tracker = c.Process(
@@ -364,8 +399,10 @@ class Service:
                     )
                 time.sleep(0.01)
             self.state, self.message = "running", "Running"
+            logger.info("Session %s running: %s", self.session, self.source_info)
             return self.snapshot()
         except Exception:
+            logger.exception("Session %s failed to start", self.session)
             self._stop()
             stats["capture_fault"].value = 1
             for name, event in [
@@ -382,6 +419,7 @@ class Service:
         if not run or self.state != "running" or run["ring"] is None:
             raise RuntimeError("Start camera or simulation tracking before recording.")
         if not enabled:
+            logger.info("Recording stop requested: %s", self.directory)
             with run["recording_generation"].get_lock():
                 run["recording"].clear()
             run["recording_stop"].set()
@@ -450,6 +488,7 @@ class Service:
             raise
         with run["recording_generation"].get_lock():
             run["recording"].set()
+        logger.info("Recording started: %s", self.directory)
         return self.snapshot()
 
     def _stop(self):
@@ -458,6 +497,7 @@ class Service:
             self.run["recording_stop"].set()
             self.run["stop"].set()
             if self.run["stop_time"] is None:
+                logger.info("Session %s stop requested", self.session)
                 self.run["stop_time"] = time.monotonic()
             self.state = "stopping"
         return self.snapshot()
@@ -471,15 +511,19 @@ class Service:
                 kind = e["kind"]
                 if kind in ("error", "record_error"):
                     self.message = e["message"]
+                    logger.error("Session %s %s: %s", self.session, kind, e["message"])
                 elif kind == "playback":
                     self.playback_info = {"achieved": e.get("achieved"), "requested": e.get("requested")}
                 elif kind == "priority":
                     self.priority_info.append(e["message"])
+                    logger.info("%s", e["message"])
                 elif kind == "template":
                     self.config.value.template = e["template"]
                 elif kind in ("source", "dimensions"):
                     self.source_info.update({k: v for k, v in e.items()
                                              if k in SourceStatus.model_fields})
+                    if "camera_mode_info" in e and e["camera_mode_info"] != self.camera_mode_info:
+                        logger.info("Camera mode: %s", e["camera_mode_info"])
                     if "camera_mode_info" in e:
                         self.camera_mode_info = e["camera_mode_info"]
                     if "camera_controls" in e:
@@ -523,6 +567,13 @@ class Service:
                 else:
                     self._stop()
                 self.message = f"{name} worker exited unexpectedly ({proc.exitcode})."
+                logger.critical(
+                    "Session %s: %s worker (pid %s) exited unexpectedly: %s",
+                    self.session,
+                    name,
+                    proc.pid,
+                    describe_exitcode(proc.exitcode),
+                )
         if run["capture_done"].is_set() and self.state == "running":
             self._stop()
         if run["stop_time"] is not None:
@@ -537,6 +588,12 @@ class Service:
                     run["stats"][fault].value = 3
                     self.message = (
                         f"{name} did not stop; forced termination. Session incomplete."
+                    )
+                    logger.error(
+                        "Session %s: %s worker did not stop within %s s; terminated.",
+                        self.session,
+                        name,
+                        limit,
                     )
         if all(
             run[k].is_set() for k in ("capture_done", "tracking_done", "writer_done")
@@ -557,6 +614,15 @@ class Service:
                 )
             )
             self.state = "error" if faulty else "idle"
+            logger.log(
+                logging.ERROR if faulty else logging.INFO,
+                "Session %s ended (%s): %s; exits=%s; stats=%s",
+                self.session,
+                self.state,
+                self.message,
+                {n: describe_exitcode(p.exitcode) for n, p in run["processes"].items()},
+                self.last_stats,
+            )
             if not faulty:
                 self.message = (
                     "Session finished; recording finalized."
@@ -698,6 +764,7 @@ class Service:
                     reply = self._execute(command, args)
                     future.set_result(reply)
                 except Exception as exc:
+                    logger.warning("Command %r failed: %s", command, exc)
                     self.message = str(exc)
                     future.set_exception(exc)
             except queue.Empty:

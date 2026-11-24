@@ -25,6 +25,7 @@
     "pupil_adaptive_window": 61,
     "pupil_adaptive_offset": 7,
     "pupil_thr": 93,
+    "pupil_mask_cleanup": 0,
     "pupil_min": 30,
     "pupil_max": 3000,
     "cr_thr": 181,

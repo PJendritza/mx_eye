@@ -210,12 +210,16 @@ class Service:
                         )
 
     def _dispatch_request(self, request: ControlRequest) -> ControlReply:
+        received_ns = time.time_ns()
         if request.command is Command.STATUS:
             return ControlReply(status=self.snapshot())
-        args = {"event": request.experiment_event} if request.experiment_event else {}
+        args = (
+            {"event": request.experiment_event, "received_ns": received_ns}
+            if request.experiment_event else {}
+        )
         return ControlReply(status=self.submit(request.command, **args).result(timeout=15))
 
-    def _experiment_event(self, event):
+    def _experiment_event(self, event, received_ns):
         if self.experiment_events.contains(event):
             return self.snapshot()
         owner = (event.run_id, event.visit_id)
@@ -234,7 +238,7 @@ class Service:
                     event.model_dump_json(indent=2), encoding="utf-8"
                 )
         directory = self._event_directory if owner == self._event_visit else None
-        self.experiment_events.save(event, directory)
+        self.experiment_events.save(event, directory, received_ns=received_ns)
         if kind in (ExperimentEventKind.ANIMAL_LEFT, ExperimentEventKind.RUN_ENDED,
                     ExperimentEventKind.DETECTOR_FAULT) and owner == self._event_visit:
             if self.run and self.state == "running":
@@ -275,6 +279,8 @@ class Service:
             capture_done=c.Event(),
             tracking_done=c.Event(),
             writer_done=c.Event(),
+            writer_exited=c.Event(),
+            writer_commands=c.Queue(1) if recordable else None,
             paused=c.Event(),
             commands=c.Queue(64),
             capture_commands=c.Queue(16),
@@ -332,6 +338,22 @@ class Service:
         )
         try:
             run["writer_done"].set()
+            run["writer_exited"].set()
+            if recordable:
+                writer = c.Process(
+                    target=writer_worker,
+                    name="mx-eye recording",
+                    args=(
+                        self.session, run["writer_commands"], run["stop"],
+                        run["ring"], run["samples"], run["recording_capture_done"],
+                        run["tracking_done"], run["writer_done"], run["writer_exited"],
+                        stats, run["events"], run["camera_diagnostics_path"],
+                    ),
+                    kwargs={},
+                )
+                writer.start()
+                run["processes"]["writer"] = writer
+                run["writer_exited"].clear()
             tracker = c.Process(
                 target=tracking_worker,
                 name="mx-eye tracking",
@@ -389,14 +411,18 @@ class Service:
             capture.start()
             run["processes"]["capture"] = capture
             deadline = time.monotonic() + 10
-            while "width" not in self.source_info:
+            while "width" not in self.source_info or (
+                recordable and "writer_ready" not in run["ready"]
+            ):
                 self._events()
                 if stats["capture_fault"].value:
                     raise RuntimeError(self.message)
+                if recordable and writer.exitcode is not None:
+                    raise RuntimeError("Recording process exited during startup.")
                 if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        "Source did not return its first frame within 10 seconds."
-                    )
+                    if "width" not in self.source_info:
+                        raise TimeoutError("Source did not return its first frame within 10 seconds.")
+                    raise TimeoutError("Recording process did not initialize within 10 seconds.")
                 time.sleep(0.01)
             self.state, self.message = "running", "Running"
             logger.info("Session %s running: %s", self.session, self.source_info)
@@ -408,7 +434,7 @@ class Service:
             for name, event in [
                 ("capture", "capture_done"),
                 ("tracker", "tracking_done"),
-                ("writer", "writer_done"),
+                ("writer", "writer_exited"),
             ]:
                 if name not in run["processes"]:
                     run[event].set()
@@ -426,68 +452,22 @@ class Service:
             return self.snapshot()
         if run["recording"].is_set():
             return self.snapshot()
-        previous = run["processes"].get("writer")
-        if previous is not None:
-            if not run["writer_done"].is_set() or previous.is_alive():
-                raise RuntimeError(
-                    "Wait for the previous recording to finish draining."
-                )
-            previous.join()
         if run["stats"]["record_fault"].value:
             raise RuntimeError("Restart tracking after resolving the recording fault.")
+        if not run["writer_done"].is_set():
+            raise RuntimeError("Wait for the previous recording to finish draining.")
         config = MxEyeConfigStore(self.config.value.model_copy(deep=True))
         directory = reserve_recording_directory(Path(config.value.recording.directory))
         for key in ("enqueued", "written", "record_acquired", "log_fault", "recorded_seconds", "recording_dropped", "record_camera_rejected"):
             run["stats"][key].value = 0
-        run["recording_stop"].clear()
-        run["writer_done"].clear()
-        run["ready"].discard("writer_ready")
-        self.directory = str(directory)
-        writer = self.ctx.Process(
-            target=writer_worker,
-            name="mx-eye recording",
-            args=(
-                config,
-                self.session,
-                self.directory,
-                run["ring"],
-                run["samples"],
-                run["capture_done"],
-                run["tracking_done"],
-                run["writer_done"],
-                run["stats"],
-                run["events"],
-            ),
-            kwargs={
-                "directory_reserved": True,
-                "camera_diagnostics_path": run["camera_diagnostics_path"],
-                "recording_capture_done": run["recording_capture_done"],
-                "recording_generation": run["recording_generation"].value + 1,
-            },
-        )
-        run["recording_generation"].value += 1
-        try:
-            writer.start()
-            run["processes"]["writer"] = writer
-            deadline = time.monotonic() + 10
-            while "writer_ready" not in run["ready"]:
-                self._events()
-                if run["stats"]["record_fault"].value or writer.exitcode is not None:
-                    raise RuntimeError(
-                        self.message or "Recording could not initialize."
-                    )
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        "Recording did not initialize within 10 seconds."
-                    )
-                time.sleep(0.01)
-        except Exception:
-            run["recording_stop"].set()
-            if writer.pid is None:
-                run["writer_done"].set()
-            raise
         with run["recording_generation"].get_lock():
+            generation = run["recording_generation"].value + 1
+            run["writer_commands"].put_nowait((config, str(directory), generation))
+            run["recording_stop"].clear()
+            run["writer_done"].clear()
+            run["recording_generation"].value = generation
             run["recording"].set()
+        self.directory = str(directory)
         logger.info("Recording started: %s", self.directory)
         return self.snapshot()
 
@@ -551,7 +531,7 @@ class Service:
         pairs = [
             ("capture", "capture_done", "capture_fault"),
             ("tracker", "tracking_done", "tracking_fault"),
-            ("writer", "writer_done", "record_fault"),
+            ("writer", "writer_exited", "record_fault"),
         ]
         for name, done, fault in pairs:
             proc = run["processes"].get(name)
@@ -564,6 +544,9 @@ class Service:
                 run["stats"][fault].value = 3
                 if name == "writer":
                     run["stats"]["log_fault"].value = 1
+                    run["recording"].clear()
+                    run["recording_stop"].set()
+                    run["writer_done"].set()
                 else:
                     self._stop()
                 self.message = f"{name} worker exited unexpectedly ({proc.exitcode})."
@@ -596,7 +579,7 @@ class Service:
                         limit,
                     )
         if all(
-            run[k].is_set() for k in ("capture_done", "tracking_done", "writer_done")
+            run[k].is_set() for k in ("capture_done", "tracking_done", "writer_exited")
         ):
             for proc in run["processes"].values():
                 proc.join(0.05)
@@ -643,7 +626,7 @@ class Service:
                     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
                 except (OSError, ValueError):
                     pass
-            for k in ("commands", "capture_commands", "events", "samples"):
+            for k in ("commands", "capture_commands", "events", "samples", "writer_commands"):
                 if run[k] is not None:
                     run[k].cancel_join_thread()
                     run[k].close()
@@ -651,7 +634,7 @@ class Service:
 
     def _execute(self, command, args):
         if command == Command.EXPERIMENT_EVENT:
-            return self._experiment_event(args["event"])
+            return self._experiment_event(args["event"], args["received_ns"])
         if command == Command.RECORDING_START:
             return self._record(True)
         if command == Command.RECORDING_STOP:

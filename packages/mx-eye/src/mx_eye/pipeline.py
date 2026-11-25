@@ -765,25 +765,44 @@ def restore_template(core, data):
 
 
 def writer_worker(
-    config,
     session,
-    directory,
+    commands,
+    stop,
     ring,
     samples,
-    capture_done,
+    recording_capture_done,
     tracking_done,
     done,
+    exited,
     stats,
     events,
+    camera_diagnostics_path,
     test_delay=0,
-    recording_capture_done=None, recording_generation=0,
-    directory_reserved=False,
-    camera_diagnostics_path=None,
 ):
+    """Reuse the process for successive recordings in one tracking session."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
     runtime_log.attach_worker("recording")
     report(events, "priority", message=priority("recording"))
+    report(events, "writer_ready")
+    while not (stop.is_set() and done.is_set()):
+        try:
+            config, directory, generation = commands.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        _write_recording(
+            config, session, directory, ring, samples, recording_capture_done,
+            tracking_done, done, stats, events, generation,
+            camera_diagnostics_path, test_delay,
+        )
+    exited.set()
+
+
+def _write_recording(
+    config, session, directory, ring, samples, recording_capture_done,
+    tracking_done, done, stats, events, recording_generation,
+    camera_diagnostics_path, test_delay,
+):
     folder = Path(directory)
     writer = None
     error = ""
@@ -793,15 +812,12 @@ def writer_worker(
     first_monotonic = last_monotonic = None
     frame_file = sample_file = None
     try:
-        if not directory_reserved:
-            folder.mkdir(parents=True, exist_ok=False)
         config.save(folder / "config.json")
         frame_file = (folder / "frames.csv").open("w", newline="", encoding="utf-8")
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
         fw, sw = csv.writer(frame_file), csv.writer(sample_file)
         fw.writerow(["video_index", "source_frame", "acquisition_ns", "media_ns", "acquisition_monotonic_ns"])
         sw.writerow([*TRACKING_COLUMNS, 'image_brightness'])
-        report(events, "writer_ready")
         while True:
             for _ in range(256):
                 try:
@@ -840,8 +856,8 @@ def writer_worker(
                     frame_file.flush()
                     sample_file.flush()
             elif (
-                (recording_capture_done.value >= recording_generation if recording_capture_done is not None else capture_done.is_set())
-                and (log_finished if recording_capture_done is not None else tracking_done.is_set())
+                recording_capture_done.value >= recording_generation
+                and log_finished
                 and stats["written"].value >= stats["enqueued"].value
             ):
                 # tracking_done is set only after its sample-queue feeder flushed.

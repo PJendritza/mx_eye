@@ -203,7 +203,6 @@ def test_recording_saves_its_rejection_counts_and_rows(tmp_path, monkeypatch):
             wait_until(
                 lambda: (
                     service.run["writer_done"].is_set()
-                    and not service.run["processes"]["writer"].is_alive()
                 )
             )
             summary = json.loads((folder / "session.json").read_text())

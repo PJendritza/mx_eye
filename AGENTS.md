@@ -432,9 +432,9 @@ Reference documentation: [Python multiprocessing](https://docs.python.org/3/libr
 
 The service reserves the configured shared frame-ring budget at tracking start so
 capture/tracking processes can use it without passing large images through pipes.
-No writer process runs and no frames/samples are copied into recording queues until
-Record is enabled. Each Record cycle starts a fresh writer and folder. Shared ring
-indices persist across writers. Stop recording clears the producer gate; capture
+Camera or simulation tracking starts one writer process. Each Record cycle starts
+a fresh folder, and frames and samples enter the recording queues only while
+recording is enabled. The writer waits between recordings. Stop recording clears the producer gate; capture
 acknowledges at its next loop boundary and tracking sends a FIFO sentinel after its
 last logged row. The writer drains frames/rows before finalizing. Recording-only
 frame counts determine completeness, rather than all frames acquired during the

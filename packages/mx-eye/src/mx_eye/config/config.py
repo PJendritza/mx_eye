@@ -2,6 +2,7 @@
 """Typed, versioned settings. All image coordinates use source pixels."""
 
 import json
+import logging
 from enum import StrEnum, auto
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -17,6 +18,7 @@ from pydantic import (
 
 from ..calibration import CalibrationProfile
 
+logger = logging.getLogger(__name__)
 _UNCHANGED = object()
 
 
@@ -225,6 +227,15 @@ class MxEyeConfigStore:
             if isinstance(network, dict):
                 raw["network"] = {key: value for key, value in network.items()
                                   if key != "sync_port"}
+        if isinstance(raw, dict) and raw.get("format") == "mx-eye":
+            calibration = raw.get("calibration")
+            if (
+                isinstance(calibration, dict)
+                and calibration.get("format") == "mx-eye-calibration"
+                and calibration.get("version") in (None, "1.0.0", "1.1.0")
+            ):
+                logger.warning("Skipped an old calibration in %s. Load or create a 1.2.0 profile.", path)
+                raw = {key: value for key, value in raw.items() if key != "calibration"}
         return cls(MxEyeConfigModel.model_validate(raw), path)
 
     def save(self, path: Path) -> None:

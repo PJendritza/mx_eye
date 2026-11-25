@@ -137,8 +137,11 @@ folder for restoration at restart. Opening a video, loading a configuration or
 editing tracking/camera settings does not replace the selected profile; calibration
 changes are explicit in the calibration workspace. A profile is only applied when
 its declared input matches the tracking mode; otherwise the main status says it
-is inactive. The preview's 90° CCW rotation is display-only; output remains in
-Pygame screen pixels with the JSON's signed gains, rotation and screen-axis offsets.
+is inactive. The preview is centered and follows the mounted screen. In profile
+version `1.2.0`, `offset_x` moves right and `offset_y` moves up, in physical
+screen pixels. These shifts are applied after gain and rotation. Calibrated output
+to the task still uses top-left Pygame pixels. Regenerate old calibration profiles
+and use a calibrator that exports version `1.2.0`.
 
 The source controls show Start/Stop for camera and simulation, or Open video for
 file playback. Switching source stops the current session. **Record** starts and

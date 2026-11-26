@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import time
 from pathlib import Path
 
 from mx_eye_protocol.events import ExperimentEvent
@@ -19,12 +18,12 @@ class EventJournal:
     def contains(self, event):
         return event.event_id in self._seen
 
-    def save(self, event: ExperimentEvent, recording_directory: str | None):
+    def save(self, event: ExperimentEvent, recording_directory: str | None, *, received_ns: int):
         # The run ID is user data, never a filesystem path.
         key = hashlib.sha256(event.run_id.encode()).hexdigest()[:24]
         path = data_root() / "events" / f"{key}.jsonl"
         row = {
-            "received_ns": time.time_ns(),
+            "received_ns": received_ns,
             "recording_directory": recording_directory,
             "event": event.model_dump(mode="json"),
         }

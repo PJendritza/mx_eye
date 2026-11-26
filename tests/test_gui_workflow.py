@@ -52,8 +52,7 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
             before = service.snapshot().stats.tracked
             wait_until(lambda: service.snapshot().stats.tracked >= before + 3)
             service.submit("record", enabled=False).result(timeout=3)
-            wait_until(lambda: service.run["writer_done"].is_set()
-                       and not service.run["processes"]["writer"].is_alive())
+            wait_until(lambda: service.run["writer_done"].is_set())
             assert service.snapshot().state == "running"
             before = service.snapshot().stats.tracked
             wait_until(lambda: service.snapshot().stats.tracked > before + 2)
@@ -71,8 +70,7 @@ def test_recording_can_stop_and_restart_without_stopping_tracking(tmp_path):
         # A rapid click pair must still produce a reliable end-of-log boundary.
         service.submit("record", enabled=True).result(timeout=15)
         service.submit("record", enabled=False).result(timeout=3)
-        wait_until(lambda: service.run["writer_done"].is_set()
-                   and not service.run["processes"]["writer"].is_alive())
+        wait_until(lambda: service.run["writer_done"].is_set())
         # Stopping tracking while recording must also drain/finalize.
         service.submit("record", enabled=True).result(timeout=15)
         wait_until(lambda: service.snapshot().stats.written >= 3)
@@ -115,8 +113,7 @@ def test_recording_overload_skips_frames_and_preserves_timing(monkeypatch, tmp_p
         before = service.snapshot().stats.tracked
         wait_until(lambda: service.snapshot().stats.tracked > before + 2)
         service.submit("record", enabled=False).result(timeout=3)
-        wait_until(lambda: service.run["writer_done"].is_set()
-                   and not service.run["processes"]["writer"].is_alive())
+        wait_until(lambda: service.run["writer_done"].is_set())
         summary = json.loads((directory / "session.json").read_text())
         assert summary["complete"], summary
         assert not summary["all_frames_saved"]
@@ -143,8 +140,7 @@ def test_recording_overload_skips_frames_and_preserves_timing(monkeypatch, tmp_p
         assert service.snapshot().recording
         assert Path(service.directory) != directory
         service.submit("record", enabled=False).result(timeout=3)
-        wait_until(lambda: service.run["writer_done"].is_set()
-                   and not service.run["processes"]["writer"].is_alive())
+        wait_until(lambda: service.run["writer_done"].is_set())
     finally:
         service.close()
 

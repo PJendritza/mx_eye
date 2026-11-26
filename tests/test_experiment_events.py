@@ -70,11 +70,24 @@ def test_visit_recording_events_and_retry(tmp_path, monkeypatch):
     service = Service(config)
     eye = MxEye(MxEyeConfig(data_port=config.value.network.data_port,
                             control_port=config.value.network.control_port))
+    record = service._record
+    start_handling_ns = []
+
+    def record_with_timestamp(enabled):
+        if enabled:
+            start_handling_ns.append(time.time_ns())
+        return record(enabled)
+
+    monkeypatch.setattr(service, "_record", record_with_timestamp)
+
     def event(kind, **kwargs):
         return ExperimentEvent(kind=kind, timestamp_ns=time.time_ns(),
             run_id="run-1", visit_id="visit-1", control_recording=True, **kwargs)
     try:
         eye.start()
+        writer = service.run["processes"]["writer"]
+        assert writer.is_alive()
+        assert not Path(config.value.recording.directory).exists()
         entry = event("animal_entered", animal="monkey", rfid_id="tag-1")
         started = eye.send_event(entry)
         assert started.recording
@@ -96,9 +109,30 @@ def test_visit_recording_events_and_retry(tmp_path, monkeypatch):
         rows = [json.loads(row) for row in (directory / "events.jsonl").read_text().splitlines()]
         assert [row["event"]["kind"] for row in rows] == [
             "animal_entered", "animal_identified", "stimulus_shown", "animal_left"]
+        assert entry.timestamp_ns <= rows[0]["received_ns"] <= start_handling_ns[0]
+        assert len(start_handling_ns) == 1
         assert json.loads((directory / "experiment.json").read_text())["visit_id"] == "visit-1"
         assert (directory / "tracking.csv").exists()
         assert json.loads((directory / "session.json").read_text())["complete"]
+
+        second_entry = ExperimentEvent(
+            kind="animal_entered", timestamp_ns=time.time_ns(),
+            run_id="run-1", visit_id="visit-2", control_recording=True,
+        )
+        second = Path(eye.send_event(second_entry).directory)
+        assert second != directory
+        assert service.run["processes"]["writer"] is writer and writer.is_alive()
+        deadline = time.monotonic() + 10
+        while not eye.status().stats.written:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        eye.stop()
+        deadline = time.monotonic() + 10
+        while service.run is not None:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert not writer.is_alive()
+        assert json.loads((second / "session.json").read_text())["complete"]
     finally:
         eye.close()
         service.close()

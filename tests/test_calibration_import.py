@@ -9,10 +9,10 @@ from mx_eye.service import Service
 
 
 def example():
-    # The profile exported by mx_calibrator for Patrick's real recording.
+    # A physical-axis profile for the same target mapping as a real recording.
     return CalibrationProfile(
         animal_id='default', screen_width=1024, screen_height=600,
-        gain_x=-54.88, gain_y=30.49, rotation_deg=90, offset_x=174, offset_y=146,
+        gain_x=-54.88, gain_y=30.49, rotation_deg=90, offset_x=146, offset_y=174,
     )
 
 
@@ -27,6 +27,27 @@ def test_import_preserves_identity_and_exact_flip_rotation(tmp_path):
     assert CalibrationStore(store.root).load_last_active() == profile
     for x, y in np.random.default_rng(42).uniform(-20, 20, (100, 2)):
         assert imported.apply(x, y) == pytest.approx((686 - 30.49*y, 446 - 54.88*x))
+
+
+def test_legacy_calibration_requires_regeneration_but_settings_still_load(tmp_path):
+    store = cfg.MxEyeConfigStore.defaults()
+    store.value.tracking.pupil_thr = 73
+    settings = tmp_path / "config.json"
+    store.save(settings)
+    old = example().dump()
+    old["version"] = "1.1.0"
+    del old["offset_coordinate_system"]
+    path = tmp_path / "legacy_calibration.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    with pytest.raises(ValueError, match="1.2.0"):
+        CalibrationStore(tmp_path / "local").import_profile(path)
+
+    data = json.loads(settings.read_text("utf-8"))
+    data["calibration"] = old
+    settings.write_text(json.dumps(data), encoding="utf-8")
+    loaded = cfg.MxEyeConfigStore.load(settings)
+    assert loaded.value.calibration is None
+    assert loaded.value.tracking.pupil_thr == 73
 
 
 def test_source_and_configuration_changes_keep_selected_calibration():
@@ -79,7 +100,7 @@ def test_load_button_updates_view_and_remembers_profile(tmp_path, monkeypatch):
     window._import_profile()
     assert emitted[-1] == profile
     assert window._profile_from_controls() == profile
-    assert window._display_point(*profile.apply(1, 0)) == pytest.approx((391.12, 338))
+    assert window._display_point(*profile.apply(1, 0)) == pytest.approx((91.12, 174))
     assert store.load_last_active() == profile
     # An invalid replacement must leave the active profile untouched.
     path.write_text(json.dumps({'format': 'wrong'}))

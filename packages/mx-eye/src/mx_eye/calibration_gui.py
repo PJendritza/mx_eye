@@ -82,7 +82,6 @@ class CalibrationWindow(W.QMainWindow):
         self.plot.setLabel("left", "Physical screen Y", units="px")
         view = self.plot.getViewBox()
         view.setAspectLocked(True)
-        view.invertY(True)
         view.sigRangeChanged.connect(self._update_zoom_label)
         self.screen_page = W.QGraphicsRectItem()
         self.screen_page.setPen(pg.mkPen("#65717e", width=3))
@@ -115,10 +114,10 @@ class CalibrationWindow(W.QMainWindow):
         self.offset_x = self._number(-32768, 32768, 2)
         self.offset_y = self._number(-32768, 32768, 2)
         form.addRow(
-            "Offset X (px)", self._with_slider(self.offset_x, -32768, 32768, 1)
+            "Offset X (px, + right)", self._with_slider(self.offset_x, -32768, 32768, 1)
         )
         form.addRow(
-            "Offset Y (px)", self._with_slider(self.offset_y, -32768, 32768, 1)
+            "Offset Y (px, + up)", self._with_slider(self.offset_y, -32768, 32768, 1)
         )
         self.gain_x = self._number(-200, 200, 3)
         self.gain_y = self._number(-200, 200, 3)
@@ -300,14 +299,13 @@ class CalibrationWindow(W.QMainWindow):
         size_changed = size != self._screen_size
         self._screen_size = size
         display_width, display_height = self._display_size()
-        self.screen_page.setRect(0, 0, display_width, display_height)
+        self.screen_page.setRect(-display_width / 2, -display_height / 2, display_width, display_height)
         if fit or size_changed:
             self._fit_screen()
 
     def _fit_screen(self) -> None:
-        display_width, display_height = self._display_size()
         self.plot.getViewBox().setRange(
-            C.QRectF(0, 0, display_width, display_height),
+            self.screen_page.rect(),
             padding=0.12,
         )
 
@@ -316,8 +314,7 @@ class CalibrationWindow(W.QMainWindow):
         return self.profile.screen_height, self.profile.screen_width
 
     def _display_point(self, x: float, y: float) -> tuple[float, float]:
-        """Rotate pygame screen coordinates for the physically oriented view."""
-        return y, self.profile.screen_width - x
+        return self.profile.physical_point(x, y)
 
     def _zoom(self, factor: float) -> None:
         self.plot.getViewBox().scaleBy((factor, factor))
@@ -358,17 +355,14 @@ class CalibrationWindow(W.QMainWindow):
         if self._last_raw is None:
             self.status.setText("No valid eye position is available yet")
             return
-        raw_x, raw_y, cr_x = self._last_raw
-        raw_x = self.profile.compensate_x(raw_x, cr_x)
-        if not math.isfinite(raw_x):
+        x, y = self._display_point(*self.profile.apply(*self._last_raw))
+        if not (math.isfinite(x) and math.isfinite(y)):
             self.status.setText("Head compensation needs a corneal reflection")
             return
-        theta = math.radians(self.rotation.value())
-        cosine, sine = math.cos(theta), math.sin(theta)
-        scaled_x = raw_x * self.gain_x.value()
-        scaled_y = raw_y * self.gain_y.value()
-        self.offset_x.setValue(-(cosine * scaled_x - sine * scaled_y))
-        self.offset_y.setValue(-(sine * scaled_x + cosine * scaled_y))
+        self._loading = True
+        self.offset_x.setValue(self.profile.offset_x - x)
+        self.offset_y.setValue(self.profile.offset_y - y)
+        self._loading = False
         self._controls_changed()
 
     def _reset(self) -> None:

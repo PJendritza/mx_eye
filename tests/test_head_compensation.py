@@ -46,7 +46,7 @@ def test_compensation_without_corneal_reflection_has_no_position():
 
 
 def test_mx_calibrator_export_imports_with_its_head_compensation(tmp_path):
-    # Key layout written by mx_calibrator's export_profile for a compensated profile.
+    # Shared key layout for a compensated physical-axis profile.
     exported = profile(head_comp_x_slope=0.35, head_comp_x_ref=640.0).model_dump(mode="json")
     path = tmp_path / "exported.json"
     path.write_text(json.dumps(exported))
@@ -122,6 +122,10 @@ def test_calibration_window_loads_and_edits_head_compensation(tmp_path, monkeypa
     window.update_sample(3.0, -2.0, 700.0)
     expected = window._display_point(*emitted[-1].apply(3.0, -2.0, 700.0))
     assert tuple(window.current.getData()[0]) + tuple(window.current.getData()[1]) == pytest.approx(expected)
+    window.rotation.setValue(88)
+    window._set_current_as_center()
+    centered = window._display_point(*emitted[-1].apply(3.0, -2.0, 700.0))
+    assert centered == pytest.approx((0, 0), abs=0.005)
     window.update_sample(3.0, -2.0)  # no CR: not plotted, nothing raised
     window._set_current_as_center()
     assert "corneal reflection" in window.status.text()

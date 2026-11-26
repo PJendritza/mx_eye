@@ -25,15 +25,16 @@ class CalibrationProfile(BaseModel):
     )
 
     format: Literal["mx-eye-calibration"] = "mx-eye-calibration"
-    version: Literal["1.1.0"] = "1.1.0"
+    version: Literal["1.2.0"] = "1.2.0"
+    offset_coordinate_system: Literal["physical_screen_y_up"] = "physical_screen_y_up"
     calibration_id: UUID = Field(default_factory=uuid4)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     animal_id: str = Field(min_length=1)
     screen_width: int = Field(default=1024, gt=0, le=32768)
     screen_height: int = Field(default=600, gt=0, le=32768)
     input_coordinate_system: str = Field(default="pupil_minus_cr", min_length=1)
-    offset_x: float = 0.0
-    offset_y: float = 0.0
+    offset_x: float = 0.0  # Physical screen pixels, positive to the right.
+    offset_y: float = 0.0  # Physical screen pixels, positive up.
     gain_x: float = 1.0
     gain_y: float = 1.0
     rotation_deg: float = 0.0
@@ -42,31 +43,6 @@ class CalibrationProfile(BaseModel):
     # disables it, and such profiles are saved without these two keys.
     head_comp_x_slope: float = 0.0
     head_comp_x_ref: float = 0.0
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_origin_profiles(cls, value: Any) -> Any:
-        """Convert the original origin-based transform to offset-only form."""
-        if not isinstance(value, dict):
-            return value
-        data = dict(value)
-        raw_x = float(data.pop("raw_origin_x", 0.0))
-        raw_y = float(data.pop("raw_origin_y", 0.0))
-        if raw_x or raw_y:
-            gain_x = float(data.get("gain_x", 1.0))
-            gain_y = float(data.get("gain_y", 1.0))
-            theta = math.radians(float(data.get("rotation_deg", 0.0)))
-            cosine, sine = math.cos(theta), math.sin(theta)
-            origin_x = raw_x * gain_x
-            origin_y = raw_y * gain_y
-            data["offset_x"] = float(data.get("offset_x", 0.0)) - (
-                cosine * origin_x - sine * origin_y
-            )
-            data["offset_y"] = float(data.get("offset_y", 0.0)) - (
-                sine * origin_x + cosine * origin_y
-            )
-        data["version"] = "1.1.0"
-        return data
 
     @model_validator(mode="after")
     def validate_gain(self) -> Self:
@@ -77,6 +53,11 @@ class CalibrationProfile(BaseModel):
     @property
     def screen_center(self) -> tuple[float, float]:
         return self.screen_width / 2, self.screen_height / 2
+
+    def physical_point(self, x: float, y: float) -> tuple[float, float]:
+        """Convert Pygame pixels to centered physical screen pixels, Y up."""
+        center_x, center_y = self.screen_center
+        return y - center_y, x - center_x
 
     @property
     def head_compensated(self) -> bool:
@@ -108,9 +89,11 @@ class CalibrationProfile(BaseModel):
         theta = math.radians(self.rotation_deg)
         cosine, sine = math.cos(theta), math.sin(theta)
         center_x, center_y = self.screen_center
+        # With the screen mounted 90° CCW, Pygame +X is physically up
+        # and Pygame +Y is physically right.
         return (
-            center_x + cosine * dx - sine * dy + self.offset_x,
-            center_y + sine * dx + cosine * dy + self.offset_y,
+            center_x + cosine * dx - sine * dy + self.offset_y,
+            center_y + sine * dx + cosine * dy + self.offset_x,
         )
 
     def matches_tracking(self, tracking: Any) -> bool:
@@ -124,7 +107,7 @@ class CalibrationProfile(BaseModel):
         return self.input_coordinate_system == system
 
     def dump(self) -> dict[str, Any]:
-        """JSON for disk; without head compensation, exactly the 1.1.0 keys."""
+        """JSON for disk, omitting head compensation fields when disabled."""
         exclude = None if self.head_compensated else {"head_comp_x_slope", "head_comp_x_ref"}
         return self.model_dump(mode="json", exclude=exclude)
 
